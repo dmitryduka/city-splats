@@ -1,0 +1,443 @@
+"""Jobs: process one contribution (ingest -> SfM/register -> layers -> dense cloud ->
+publish) and train one version's splat (train -> remove floaters -> LoD)."""
+
+from __future__ import annotations
+
+import json
+import logging
+import shutil
+import time
+from pathlib import Path
+
+import numpy as np
+import pycolmap
+from sqlmodel import func, select
+
+from backend.app.config import (
+    AUTO_TRAIN,
+    BUILD_LOD_BIN,
+    DATA_ROOT,
+    DENSE_STRIDE,
+    LINK_CANDIDATE_STRIDE,
+    LINK_NEIGHBORS,
+    LINK_QUERY_STRIDE,
+    LINK_RADIUS_M,
+    MIN_REGISTRATION_RATIO,
+    SCENES_ROOT,
+    TRAIN_PREVIEW_EVERY,
+    TRAIN_SETTINGS,
+    UNIFORM_INIT_POINTS,
+    UNIFORM_PIXELS,
+    files_url,
+)
+from backend.app.db import session_scope
+from backend.app.models import Contribution, Scene, Version, utcnow
+from worker import compute
+from worker.pipeline.cleanup import clean_sparse, clean_splats, points_as_splats
+from worker.pipeline.dense import (
+    cloud_as_splats, densify, merge_clouds, predict_depth, read_points_ply, write_points_ply,
+)
+from worker.pipeline.export import export_layers
+from worker.pipeline.georef import georeference
+from worker.pipeline.features import DEFAULT_FEATURES, feature_config
+from worker.pipeline.ingest import probe
+from worker.pipeline.lod import build_lod
+from worker.pipeline.pieces import Piece, apply, compose, link_piece
+from worker.pipeline.splat import Snapshot, TrainingStopped
+from worker.pipeline.uniform import uniform_init
+from worker.prefetch import Prefetcher
+from worker.progress import Progress, TimingModel, contribution_sink, rel, training_sink
+
+log = logging.getLogger(__name__)
+
+# Typical keyframes per second of video from ingest's motion-based spacing; only used to
+# pre-estimate SfM time before the frames exist.
+EXPECTED_KEYFRAME_RATE = 3.0
+
+
+def _update(contribution_id: int, **fields) -> None:
+    with session_scope() as session:
+        c = session.get(Contribution, contribution_id)
+        for key, value in fields.items():
+            setattr(c, key, value)
+        c.updated_at = utcnow()
+        session.add(c)
+        session.commit()
+
+
+def publish(
+    contribution_id: int,
+    scene_id: int,
+    head: Version | None,
+    database: Path,
+    reconstruction: Path,
+    work: Path,
+    dense_rad: Path,
+    metrics: dict,
+) -> int:
+    """Create a Version with its dense cloud (no splat yet), move HEAD, mark the
+    contribution done and queue automatic splat training if AUTO_TRAIN is set."""
+    with session_scope() as session:
+        scene = session.get(Scene, scene_id)
+        number = (
+            session.exec(select(func.max(Version.number)).where(Version.scene_id == scene_id)).one() or 0
+        ) + 1
+        version = Version(
+            scene_id=scene_id,
+            number=number,
+            parent_id=head.id if head else None,
+            contribution_id=contribution_id,
+            contribution_ids=(head.contribution_ids if head else []) + [contribution_id],
+            database_path=rel(database),
+            reconstruction_path=rel(reconstruction),
+            splat_path="",
+            splat_url="",
+            dense_url=files_url(dense_rad),
+            layers_url=files_url(work / "layers"),
+            metrics=metrics,
+        )
+        if AUTO_TRAIN in TRAIN_SETTINGS:
+            version.train_status, version.train_quality, version.train_auto = "queued", AUTO_TRAIN, True
+        session.add(version)
+        session.flush()
+        scene.head_version_id = version.id
+        scene.updated_at = utcnow()
+        contribution = session.get(Contribution, contribution_id)
+        contribution.status = "done"
+        contribution.version_id = version.id
+        contribution.progress, contribution.stage_progress, contribution.eta_seconds = 1.0, 1.0, 0.0
+        contribution.stage = "published"
+        contribution.metrics = metrics
+        contribution.preview_url = contribution.preview_step = None
+        contribution.finished_at = contribution.updated_at = utcnow()
+        session.add_all([scene, contribution])
+        session.commit()
+        return number
+
+
+def process(contribution_id: int, prefetch: Prefetcher) -> None:
+    with session_scope() as session:
+        c = session.get(Contribution, contribution_id)
+        scene = session.get(Scene, c.scene_id)
+        head = session.get(Version, scene.head_version_id) if scene.head_version_id else None
+        seq_by_dir = {
+            f"c{other.id}": other.seq
+            for other in session.exec(select(Contribution).where(Contribution.scene_id == scene.id)).all()
+        }
+
+    scene_dir = SCENES_ROOT / scene.slug
+    image_root = scene_dir / "images"
+    work = scene_dir / "contributions" / c.image_dir_name
+    # Frames and depth maps may already be there (worker.prefetch); anything else is left from
+    # an interrupted run.
+    for stale in (work / name for name in ("sfm", "link", "scene", "layers", "dense", "preview")):
+        shutil.rmtree(stale, ignore_errors=True)
+
+    device = compute.device()
+    timing = TimingModel(device)
+    video = Path(c.video_path)
+    info = probe(video)
+    est_frames = info.duration * EXPECTED_KEYFRAME_RATE
+    stages = [("ingest", timing.estimate("ingest", info.duration)), ("sfm", timing.estimate("sfm", est_frames))]
+    if head is not None:
+        stages.append(("register", timing.estimate("register", est_frames)))
+    stages += [("layers", timing.estimate("layers", est_frames)), ("dense", timing.estimate("dense", est_frames))]
+    progress = Progress(contribution_sink(c.id), stages, timing)
+    metrics: dict = {"device": device, "video_seconds": round(info.duration, 1)}
+    try:
+        # 1. Ingest (usually run ahead by the prefetcher)
+        frames, seconds = _await(prefetch.ingest(c, scene.slug, retry=True), progress, "ingest")
+        timing.record("ingest", info.duration, seconds)
+        names = [f"{c.image_dir_name}/{f['name']}" for f in frames]
+        metrics |= {"keyframes": len(names), "holdouts": sum(f["holdout"] for f in frames),
+                    "ingest_seconds": seconds}
+        for stage in ("sfm", "register", "layers"):
+            if any(name == stage for name, _ in stages):
+                progress.set_estimate(stage, timing.estimate(stage, len(names)))
+        _update(c.id, metrics=metrics)
+
+        # 2. The video's own model, its piece of the scene (usually built ahead). A scene keeps
+        # the feature type it was built with; scenes predating the "features" metric used SIFT.
+        features = feature_config(head.metrics.get("features", "sift") if head else DEFAULT_FEATURES)
+        metrics["features"] = features.name
+        sfm, seconds = _await(prefetch.piece(c, scene.slug, names, retry=True), progress, "sfm")
+        timing.record("sfm", len(names), seconds)
+        ratio = sfm.registration_ratio
+        metrics |= {
+            "registered": sfm.num_registered, "camera_model": sfm.camera_model,
+            "registration_ratio": round(ratio, 3), "reproj_error_px": round(sfm.mean_reproj_error, 3),
+            "sfm_seconds": seconds, "sfm_timings": {k: round(v, 1) for k, v in sfm.timings.items()},
+        }
+        if sfm.gps:
+            metrics["gps"] = sfm.gps
+        if sfm.chunking:
+            metrics["chunking"] = sfm.chunking
+        rejection = None
+        if sfm.defect:
+            rejection = f"reconstruction failed after retries: {sfm.defect}"
+        elif ratio < MIN_REGISTRATION_RATIO:
+            rejection = (f"only {ratio:.0%} of frames reconstructed (< {MIN_REGISTRATION_RATIO:.0%}); "
+                         "the video is likely too blurry or textureless")
+
+        # 3. Place the piece in the scene: matched against a subset of the existing pieces'
+        # frames, aligned by a similarity transform; nothing else moves (worker.pipeline.pieces).
+        gps = sfm.database_path.parent / "gps.json"
+        piece = Piece(sfm.reconstruction_path, sfm.database_path, contribution_id=c.id,
+                      gps=gps if gps.exists() else None)
+        pieces = scene_pieces(head) if head is not None else []
+        if head is not None and rejection is None:
+            pairs = -(-sfm.num_registered // LINK_QUERY_STRIDE) * LINK_NEIGHBORS
+            progress.start("register", substeps=[("match_retrieval", pairs)], rate_suffix=features.name)
+            with prefetch.paused():
+                link = link_piece(piece, pieces, work / "link", features, report=progress,
+                                  query_stride=LINK_QUERY_STRIDE, candidate_stride=LINK_CANDIDATE_STRIDE,
+                                  neighbors=LINK_NEIGHBORS, radius=LINK_RADIUS_M)
+            timing.record("register", len(names), progress.finish())
+            metrics |= {"strategy": "pieces", "gate": link.reason, "link": link.stats,
+                        "sfm_timings": metrics["sfm_timings"] | {k: round(v, 1) for k, v in link.timings.items()}}
+            if link.ok:
+                piece.scene_from_piece = link.scene_from_piece
+            else:
+                rejection = f"could not place the video in the scene: {link.reason}"
+        if rejection:
+            _update(c.id, status="rejected", metrics=metrics, error=rejection, eta_seconds=0, finished_at=utcnow())
+            return
+        pieces.append(piece)
+        _update(c.id, metrics=metrics)
+
+        # 4. The pieces as one model (training and viewer layers); viewer layers (sparse points
+        # by source video + camera centers)
+        progress.start("layers")
+        rec = compose(pieces, work / "scene")
+        metrics |= {"points": rec.num_points3D(), "points_before": head.metrics.get("points") if head else None,
+                    "pieces": [p.to_json(DATA_ROOT) for p in pieces]}
+        export_layers(rec, work / "layers", lambda name: seq_by_dir.get(name.split("/")[0], 1) - 1)
+        if geo := georeference(rec, [p.gps for p in pieces if p.gps]):
+            metrics["geo"] = geo
+        timing.record("layers", len(names), progress.finish())
+
+        # 5. Dense point cloud (the scene's main view): this video's frames densified and
+        # merged into the parent version's cloud. If densification fails, the SfM points
+        # (as round splats) stand in so the version is still viewable.
+        progress.start("dense")
+        try:
+            depth_job, relay = prefetch.depth(c, scene.slug, names, retry=True)
+            if not depth_job.done():
+                relay.attach(lambda f, detail: progress.update(0.6 * f, detail=detail))
+            depth_dir = depth_job.result()
+            with prefetch.paused():
+                dense_rad = _densify(head, pycolmap.Reconstruction(piece.reconstruction), image_root, names,
+                                     work, metrics, progress, depth_dir, scene_from_piece=piece.scene_from_piece)
+            shutil.rmtree(depth_dir, ignore_errors=True)
+        except Exception:  # noqa: BLE001 - the version is still useful without a dense cloud
+            log.exception("densification failed for contribution %s; using the sparse points", c.id)
+            clean_sparse(rec)
+            preview_dir = work / "preview"
+            preview_dir.mkdir(exist_ok=True)
+            points_as_splats(rec, preview_dir / "splat.ply")
+            dense_rad = build_lod(BUILD_LOD_BIN, preview_dir / "splat.ply", preview_dir / "lod", quality=False)
+            metrics["dense_failed"] = True
+        timing.record("dense", len(names), progress.finish())
+
+        # 6. Publish a new version and move HEAD
+        number = publish(c.id, scene.id, head, piece.database, work / "scene", work, dense_rad, metrics)
+        log.info("contribution %s published as version %s", c.id, number)
+    finally:
+        progress.close()
+
+
+def scene_pieces(version: Version) -> list[Piece]:
+    """The version's pieces; a version from before pieces is one piece (its whole model)."""
+    if "pieces" in version.metrics:
+        return [Piece.from_json(p, DATA_ROOT) for p in version.metrics["pieces"]]
+    database = DATA_ROOT / version.database_path
+    gps = database.parent / "gps.json"
+    return [Piece(DATA_ROOT / version.reconstruction_path, database, gps=gps if gps.exists() else None)]
+
+
+def _await(job: tuple, progress: Progress, stage: str):
+    """Result of a prefetch job: a stage done ahead, or one whose progress we report while
+    waiting for it."""
+    future, relay = job
+    if future.done() and future.exception() is None:
+        result, seconds = future.result()
+        progress.done_ahead(stage, seconds)
+        return result, seconds
+    progress.start(stage)
+    relay.attach(lambda f, detail: progress.update(f, detail=detail))
+    result, seconds = future.result()
+    progress.finish()
+    return result, seconds
+
+
+def _densify(head: Version | None, rec: pycolmap.Reconstruction, image_root: Path, names: list[str],
+             work: Path, metrics: dict, progress: Progress, depth_dir: Path | None = None,
+             scene_from_piece: pycolmap.Sim3d | None = None) -> Path:
+    """Dense cloud for this contribution, merged with the parent's; returns the version's
+    cloud LoD. The scene keeps the first video's voxel size. Depth maps are predicted unless
+    `depth_dir` already holds them. `rec` is the video's piece, placed by scene_from_piece."""
+    dense_dir = work / "dense"
+    dense_dir.mkdir(exist_ok=True)
+    if depth_dir is None:
+        depth_dir = dense_dir / "depth"
+        predict_depth(image_root, names, depth_dir,
+                      on_progress=lambda done, total: progress.update(
+                          0.6 * done / total, detail=f"Predicting depth {done}/{total}"))
+    stats = densify(rec, image_root, names, depth_dir, dense_dir / "contribution.ply", stride=DENSE_STRIDE,
+                    on_progress=lambda done, total: progress.update(
+                        0.6 + 0.2 * done / total, detail=f"Fusing depth maps {done}/{total}"))
+    shutil.rmtree(dense_dir / "depth", ignore_errors=True)
+    if scene_from_piece is not None:
+        xyz, rgb = read_points_ply(dense_dir / "contribution.ply")
+        write_points_ply(dense_dir / "contribution.ply", apply(scene_from_piece, xyz).astype(np.float32), rgb)
+        stats.voxel *= scene_from_piece.scale
+    parent_cloud = head.metrics.get("dense_cloud") if head else None
+    voxel = head.metrics.get("dense_voxel", stats.voxel) if head else stats.voxel
+    progress.update(0.8, detail="Merging into the scene cloud and building LoD")
+    total = merge_clouds(DATA_ROOT / parent_cloud if parent_cloud else None, dense_dir / "contribution.ply",
+                         dense_dir / "scene.ply", voxel)
+    splat_ply = dense_dir / "scene_splats.ply"
+    cloud_as_splats(dense_dir / "scene.ply", splat_ply, voxel)
+    rad = build_lod(BUILD_LOD_BIN, splat_ply, dense_dir / "lod", quality=False)
+    splat_ply.unlink()  # the LoD is what's served; scene.ply keeps the cloud itself
+    metrics |= {
+        "dense": stats.as_dict() | {"scene_points": total},
+        "dense_cloud": rel(dense_dir / "scene.ply"),
+        "dense_voxel": voxel,
+    }
+    return rad
+
+
+def _training_should_stop(version_id: int) -> bool:
+    """Cancelled from the UI, or (automatic jobs only) a new video is waiting: it will
+    produce a newer HEAD, which supersedes this training anyway."""
+    with session_scope() as session:
+        v = session.get(Version, version_id)
+        if v is None or v.train_status == "cancelling":
+            return True
+        if not v.train_auto:
+            return False
+        return session.exec(
+            select(Contribution).where(Contribution.scene_id == v.scene_id, Contribution.status == "queued")
+        ).first() is not None
+
+
+def _update_version(version_id: int, **fields) -> None:
+    with session_scope() as session:
+        v = session.get(Version, version_id)
+        for key, value in fields.items():
+            setattr(v, key, value)
+        v.updated_at = utcnow()
+        session.add(v)
+        session.commit()
+
+
+def train_version(version_id: int) -> None:
+    """Train the version's splat at its requested quality, remove floaters, build the LoD
+    and swap it in."""
+    with session_scope() as session:
+        v = session.get(Version, version_id)
+        scene = session.get(Scene, v.scene_id)
+    quality = v.train_quality or "quick"
+    steps, max_resolution = TRAIN_SETTINGS[quality]
+    # The frames live with the scene that made the reconstruction (a showcase scene such as
+    # office-tsdf borrows another scene's reconstruction and has no images of its own).
+    image_root = SCENES_ROOT / Path(v.reconstruction_path).parts[1] / "images"
+    work = SCENES_ROOT / scene.slug / "versions" / f"v{v.number}" / quality
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+
+    timing = TimingModel(compute.device())
+    progress = Progress(
+        training_sink(v.id),
+        [
+            ("train", timing.estimate(f"train.{quality}", steps)),
+            ("cleanup", timing.estimate("cleanup", 1)),
+            ("lod", timing.estimate("lod", 1)),
+        ],
+        timing,
+    )
+    previews: list[Path] = []
+    started = time.time()
+    try:
+        # Train from all SfM points (initialising from the cleaned ones scored 0.4 dB lower
+        # on the room), but carve floaters against the cleaned ones: a single bad point
+        # would carve a tunnel through real geometry.
+        reconstruction = DATA_ROOT / v.reconstruction_path
+        rec = pycolmap.Reconstruction(reconstruction)
+        removed = clean_sparse(rec)
+
+        # Uniform splats can't grow to cover gaps, so they start from the dense cloud (plus
+        # a sky shell), each with a fixed on-screen size.
+        init_ply, uniform = None, None
+        if quality == "uniform":
+            if not v.metrics.get("dense_cloud"):
+                raise RuntimeError("uniform splats need the version's dense point cloud")
+            init_ply = work / "init.ply"
+            uniform = uniform_init(DATA_ROOT / v.metrics["dense_cloud"], rec, image_root, init_ply, max_resolution,
+                                   pixels=UNIFORM_PIXELS, num_points=UNIFORM_INIT_POINTS)
+
+        progress.start("train")
+
+        def on_snapshot(s: Snapshot) -> None:
+            progress.update(s.step / s.total_steps, detail=f"Step {s.step}/{s.total_steps}")
+            if s.step >= s.total_steps:
+                return
+            preview_dir = work / f"preview_{s.step}"
+            rad = build_lod(BUILD_LOD_BIN, s.ply_path, preview_dir, quality=False)
+            _update_version(v.id, preview_url=files_url(rad), preview_step=s.step)
+            previews.append(preview_dir)
+            # Keep the latest two so a client mid-stream on the previous one doesn't 404.
+            while len(previews) > 2:
+                shutil.rmtree(previews.pop(0), ignore_errors=True)
+
+        raw_ply = compute.trainer().train(
+            image_root, reconstruction, work / "train", steps, max_resolution, init_ply, TRAIN_PREVIEW_EVERY,
+            on_snapshot, should_stop=lambda: _training_should_stop(v.id),
+            sh_degree=0 if uniform else 3, freeze_scales=uniform is not None,
+        )
+        timing.record(f"train.{quality}", steps, progress.finish())
+
+        progress.start("cleanup")
+        splat_ply = work / "splat.ply"
+        stats = clean_splats(raw_ply, rec, splat_ply)
+        shutil.rmtree(work / "train" / "exports", ignore_errors=True)
+        timing.record("cleanup", 1, progress.finish())
+
+        progress.start("lod")
+        rad = build_lod(BUILD_LOD_BIN, splat_ply, work / "lod", quality=True)
+        timing.record("lod", 1, progress.finish())
+
+        with session_scope() as session:
+            v = session.get(Version, version_id)
+            v.metrics = v.metrics | {
+                f"splat_{quality}": {
+                    "steps": steps,
+                    "max_resolution": max_resolution,
+                    **({"uniform": uniform} if uniform else {}),
+                    "sparse_points_removed": removed,
+                    "cleanup": stats.as_dict(),
+                    "seconds": round(time.time() - started, 1),
+                },
+            }
+            v.splat_path, v.splat_url, v.splat_kind = rel(splat_ply), files_url(rad), quality
+            v.splats = v.splats | {quality: v.splat_url}
+            v.train_status = v.train_detail = v.preview_url = v.preview_step = None
+            v.train_progress, v.train_eta, v.updated_at = 1.0, 0.0, utcnow()
+            session.add(v)
+            session.commit()
+        log.info("version %s: %s splat published (%s)", version_id, quality, stats.as_dict())
+    except TrainingStopped:
+        with session_scope() as session:
+            v = session.get(Version, version_id)
+            cancelled = v.train_status == "cancelling"
+        # Automatic jobs go back in the queue (dropped later if no longer HEAD).
+        _update_version(
+            version_id, train_status=None if cancelled else "queued", preview_url=None, preview_step=None,
+            train_detail="cancelled" if cancelled else "paused for a new video", train_progress=0.0, train_eta=None,
+        )
+        log.info("version %s training %s", version_id, "cancelled" if cancelled else "paused")
+    finally:
+        progress.close()
+        for preview_dir in previews:
+            shutil.rmtree(preview_dir, ignore_errors=True)

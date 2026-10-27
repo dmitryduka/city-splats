@@ -1,0 +1,21 @@
+[project]
+name = "scenes"
+version = "0.1.0"
+description = "Incremental video-to-3D scene service (COLMAP + Gaussian splats)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "pycolmap>=4.2.1",
+  "numpy",
+  "opencv-python-headless",
+  "pillow",
+  "scipy",
+  "torch",
+  "transformers",
+  "fastapi",
+  "uvicorn[standard]",
+  "sqlmodel>=0.0.48",
+  "python-multipart>=0.0.32",
+]
+
+[tool.uv]
+package = false

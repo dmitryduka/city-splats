@@ -1,0 +1,108 @@
+diff --git a/crates/brush-process/src/train_stream.rs b/crates/brush-process/src/train_stream.rs
+index abf9c0a..1d3b7c3 100644
+--- a/crates/brush-process/src/train_stream.rs
++++ b/crates/brush-process/src/train_stream.rs
+@@ -135,6 +135,10 @@ pub(crate) async fn train_stream(
+     };
+ 
+     let init_splats = init_splats.with_sh_degree(train_stream_config.model_config.sh_degree);
++    let init_splats = match train_stream_config.train_config.fixed_scale {
++        Some(scale) => init_splats.with_uniform_scale(scale),
++        None => init_splats,
++    };
+ 
+     // If the metadata has an up axis prefer that, otherwise estimate the up direction.
+     let up_axis = up_axis.or(Some(estimated_up));
+diff --git a/crates/brush-render/src/gaussian_splats.rs b/crates/brush-render/src/gaussian_splats.rs
+index 6a6b70d..6bcd640 100644
+--- a/crates/brush-render/src/gaussian_splats.rs
++++ b/crates/brush-render/src/gaussian_splats.rs
+@@ -213,6 +213,16 @@ impl Splats {
+         self
+     }
+ 
++    /// Give every splat the same isotropic scale (see `TrainConfig::fixed_scale`).
++    pub fn with_uniform_scale(mut self, scale: f32) -> Self {
++        let transforms = self.transforms.val();
++        let n = transforms.dims()[0];
++        let log_scales = Tensor::full([n, 3], scale.ln(), &transforms.device());
++        let transforms = transforms.slice_assign(s![.., 7..10], log_scales);
++        self.transforms = trainable_param(self.transforms.id, transforms);
++        self
++    }
++
+     /// Attach a per-splat world-space scale floor (see [`Splats::min_scale`]).
+     /// `f` must be `[num_splats]`. Training-only; cleared by refine and never
+     /// serialized.
+diff --git a/crates/brush-train/src/config.rs b/crates/brush-train/src/config.rs
+index 9c1155a..3a4e293 100644
+--- a/crates/brush-train/src/config.rs
++++ b/crates/brush-train/src/config.rs
+@@ -97,6 +97,16 @@ pub struct TrainConfig {
+     #[arg(long, help_heading = "Training options", default_value = "0.1")]
+     pub min_scale_factor: f32,
+ 
++    /// Uniform splats: every splat gets this isotropic world-space scale (std-dev) and scales
++    /// and rotations are never optimized. Disables the 3D filter and oversized splitting.
++    #[arg(long, help_heading = "Training options")]
++    pub fixed_scale: Option<f32>,
++
++    /// Keep every splat's initial scale (e.g. per-splat sizes from the init PLY): scales and
++    /// rotations are never optimized, as with `fixed_scale` but without overriding them.
++    #[arg(long, help_heading = "Training options")]
++    pub freeze_scales: bool,
++
+     /// Weight of l1 loss on alpha if input view has transparency.
+     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
+     pub match_alpha_weight: f32,
+@@ -150,6 +160,10 @@ impl Default for TrainConfig {
+ }
+ 
+ impl TrainConfig {
++    pub fn scales_frozen(&self) -> bool {
++        self.fixed_scale.is_some() || self.freeze_scales
++    }
++
+     pub fn total_iters(&self) -> u32 {
+         self.total_train_iters + self.lod_levels * self.lod_refine_steps
+     }
+diff --git a/crates/brush-train/src/train.rs b/crates/brush-train/src/train.rs
+index b46d080..70a11af 100644
+--- a/crates/brush-train/src/train.rs
++++ b/crates/brush-train/src/train.rs
+@@ -159,6 +159,13 @@ impl SplatTrainer {
+ 
+         // Optimizer state lives on the inner device.
+         let opt_device = device.clone().inner();
++        let mut config = config.clone();
++        if config.scales_frozen() {
++            config.lr_rotation = 0.0;
++            config.lr_scale = 0.0;
++            config.min_scale_factor = 0.0;
++            config.split_at_screen_size = 0.0;
++        }
+         let (rot, scale) = (config.lr_rotation as f32, config.lr_scale as f32);
+         let lr_scaling_fixed = Tensor::<1>::from_floats(
+             [0.0, 0.0, 0.0, rot, rot, rot, rot, scale, scale, scale],
+@@ -175,7 +182,6 @@ impl SplatTrainer {
+         // total_train_iters but their refines should never grow — clamp
+         // here so growth_stop is never effectively past end-of-training,
+         // and growth_start never past growth_stop.
+-        let mut config = config.clone();
+         config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
+         config.growth_start_iter = config.growth_start_iter.min(config.growth_stop_iter);
+ 
+@@ -727,7 +733,12 @@ impl SplatTrainer {
+                 .sqrt();
+             let offset_local = offset_factor * cur_scales;
+             let samples = quaternion_vec_multiply(cur_rots.clone(), offset_local);
+-            let new_log_scales = cur_log_scale + k_per_axis.log();
++            // Uniform splats keep their size; children only take the offset.
++            let new_log_scales = if self.config.scales_frozen() {
++                cur_log_scale
++            } else {
++                cur_log_scale + k_per_axis.log()
++            };
+             let child_rots = cur_rots;
+ 
+             let parent_transforms = Tensor::cat(

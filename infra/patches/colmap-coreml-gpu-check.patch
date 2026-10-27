@@ -1,0 +1,52 @@
+diff --git a/src/colmap/feature/extractor.cc b/src/colmap/feature/extractor.cc
+index 632b163..8757c38 100644
+--- a/src/colmap/feature/extractor.cc
++++ b/src/colmap/feature/extractor.cc
+@@ -153,9 +153,18 @@ bool FeatureExtractionOptions::Check() const {
+   if (use_gpu) {
+     CHECK_OPTION_GT(CSVToVector<int>(gpu_index).size(), 0);
+ #if !defined(COLMAP_GPU_ENABLED) && !defined(COLMAP_CUDA_ENABLED)
+-    LOG(ERROR) << "Cannot use GPU feature extraction without CUDA or OpenGL "
+-                  "support. Consider setting use_gpu to false.";
+-    return false;
++#ifdef COLMAP_COREML_ENABLED
++    // ONNX-based extractors run on the GPU/ANE through the CoreML execution
++    // provider; only SIFT needs CUDA or OpenGL.
++    const bool gpu_supported = type != FeatureExtractorType::SIFT;
++#else
++    const bool gpu_supported = false;
++#endif
++    if (!gpu_supported) {
++      LOG(ERROR) << "Cannot use GPU feature extraction without CUDA or OpenGL "
++                    "support. Consider setting use_gpu to false.";
++      return false;
++    }
+ #endif
+   }
+   switch (type) {
+diff --git a/src/colmap/feature/matcher.cc b/src/colmap/feature/matcher.cc
+index ae3ca5a..1432612 100644
+--- a/src/colmap/feature/matcher.cc
++++ b/src/colmap/feature/matcher.cc
+@@ -119,9 +119,18 @@ bool FeatureMatchingOptions::Check() const {
+   if (use_gpu) {
+     CHECK_OPTION_GT(CSVToVector<int>(gpu_index).size(), 0);
+ #ifndef COLMAP_GPU_ENABLED
+-    LOG(ERROR) << "Cannot use GPU feature matching without CUDA or OpenGL "
+-                  "support. Set use_gpu or use_gpu to false.";
+-    return false;
++#ifdef COLMAP_COREML_ENABLED
++    // ONNX-based matchers run on the GPU/ANE through the CoreML execution
++    // provider; only SIFT brute-force matching needs CUDA or OpenGL.
++    const bool gpu_supported = type != FeatureMatcherType::SIFT_BRUTEFORCE;
++#else
++    const bool gpu_supported = false;
++#endif
++    if (!gpu_supported) {
++      LOG(ERROR) << "Cannot use GPU feature matching without CUDA or OpenGL "
++                    "support. Set use_gpu to false.";
++      return false;
++    }
+ #endif
+   }
+   CHECK_OPTION_GE(max_num_matches, 0);

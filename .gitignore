@@ -1,0 +1,37 @@
+# Environments and builds
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+frontend/dist/
+target/
+.DS_Store
+
+# Third-party sources and binaries (COLMAP, Brush, Spark builds); see infra/ and README
+tools/
+
+# Scene data, uploads and test footage
+data/
+videos/
+*.db
+*.db-shm
+*.db-wal
+
+# Media and reconstruction outputs, wherever they end up
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.insv
+*.ply
+*.spz
+*.splat
+*.rad
+*.radc
+*.npz
+*.npy
+*.bin
+*.onnx
+*.safetensors
+*.pt
+*.log
