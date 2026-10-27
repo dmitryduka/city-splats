@@ -23,6 +23,8 @@ type Props = {
   splatSize?: number;
   /** Opacity of the cloud/splats (1 = as built), e.g. to see the map underneath. */
   splatOpacity?: number;
+  /** Fly speed for WASD/QE, scene units per second (Shift: 5x). */
+  moveSpeed?: number;
   onStats?: (stats: { fps: number }) => void;
   /** Where the scene lies on the map (from GPS), and which map to lay under it (null: none). */
   geo?: Geo | null;
@@ -74,6 +76,7 @@ export function SplatViewer({
   lodSplatScale = 1,
   splatSize = 1,
   splatOpacity = 1,
+  moveSpeed = 1,
   onStats,
   geo = null,
   mapStyle = null,
@@ -84,6 +87,9 @@ export function SplatViewer({
   const viewRef = useRef({ mode, showCameras });
   const onStatsRef = useRef(onStats);
   onStatsRef.current = onStats;
+  const controlsRef = useRef<SparkControls | null>(null);
+  const moveSpeedRef = useRef(moveSpeed);
+  moveSpeedRef.current = moveSpeed;
   const opacityRef = useRef(splatOpacity);
   opacityRef.current = splatOpacity;
   const onMapSourceRef = useRef(onMapSource);
@@ -128,6 +134,8 @@ export function SplatViewer({
     ctxRef.current = ctx;
 
     const controls = new SparkControls({ canvas: renderer.domElement });
+    controls.fpsMovement.moveSpeed = moveSpeedRef.current;
+    controlsRef.current = controls;
     const observer = new ResizeObserver(() => {
       camera.aspect = container.clientWidth / container.clientHeight;
       camera.updateProjectionMatrix();
@@ -247,6 +255,10 @@ export function SplatViewer({
     ctx.splats?.updateVersion();
     ctx.dirty = true;
   }, [splatSize]);
+
+  useEffect(() => {
+    if (controlsRef.current) controlsRef.current.fpsMovement.moveSpeed = moveSpeed;
+  }, [moveSpeed]);
 
   useEffect(() => {
     const ctx = ctxRef.current;

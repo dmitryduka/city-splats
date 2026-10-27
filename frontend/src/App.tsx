@@ -18,6 +18,17 @@ const SIZE_STEP = 1.15;
 // M cycles the map under a GPS-placed scene: off -> street map -> satellite -> off.
 const MAP_CYCLE: (MapStyle | null)[] = [null, "street", "satellite"];
 const clampSize = (s: number) => Math.min(4, Math.max(0.25, s));
+// Fly speed (scene units/s), remembered per browser.
+const SPEED_RANGE = [0.25, 64] as const;
+const SPEED_KEY = "flySpeed";
+const savedSpeed = () => {
+  try {
+    const v = Number(localStorage.getItem(SPEED_KEY));
+    return v >= SPEED_RANGE[0] && v <= SPEED_RANGE[1] ? v : 4;
+  } catch {
+    return 4;
+  }
+};
 
 type Toast = { id: number; text: string; kind: "info" | "error" };
 
@@ -57,6 +68,14 @@ export default function App() {
   // Cloud/splat opacity, offered while a map is shown so it can show through. Applied cubed:
   // many splats overlap along each ray, so per-splat opacity must drop fast to see through.
   const [opacity, setOpacity] = useState(1);
+  const [speed, setSpeed] = useState(savedSpeed);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SPEED_KEY, String(speed));
+    } catch {
+      // storage unavailable: the speed just isn't remembered
+    }
+  }, [speed]);
   const [mapSource, setMapSource] = useState<{ attribution: string; failed: boolean } | null>(null);
   const geoRef = useRef<Geo | null>(null);
   const [fps, setFps] = useState(0);
@@ -193,6 +212,7 @@ export default function App() {
           lodSplatScale={lodSplatScale}
           splatSize={sizable ? sizes[surface] : 1}
           splatOpacity={mapStyle && geo ? opacity ** 3 : 1}
+          moveSpeed={speed}
           onStats={onStats}
           geo={geo}
           mapStyle={mapStyle}
@@ -262,6 +282,18 @@ export default function App() {
               <span>{sizes[surface].toFixed(2)}×</span>
             </label>
           )}
+          <label className="size-slider" title="WASD / QE speed (hold Shift for 5x)">
+            fly speed
+            <input
+              type="range"
+              min={Math.log(SPEED_RANGE[0])}
+              max={Math.log(SPEED_RANGE[1])}
+              step={0.01}
+              value={Math.log(speed)}
+              onChange={(e) => setSpeed(Math.exp(Number(e.target.value)))}
+            />
+            <span>{speed < 10 ? speed.toFixed(1) : speed.toFixed(0)}/s</span>
+          </label>
           {mapStyle && geo && (mode === "dense" || mode === "splats") && (
             <label className="size-slider" title="See the map through the scene">
               opacity
