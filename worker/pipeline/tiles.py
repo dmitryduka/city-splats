@@ -9,14 +9,17 @@ side (~480 m at Achapnyak's 12 cm voxels) and splits into octants while a tile h
 the whole cloud. Leaves never merge back, so an unchanged tile keeps its key and is shared by
 reference between versions (its directory is under the contribution that last changed it).
 
-Top-level cells with fewer than STRAY_POINTS points (depth noise far outside the scene: 300
-of the 333 cells of Achapnyak v4, 0.2% of its points) share one "stray" tile instead of
-hundreds of tiny ones.
+Top-level cells with fewer than budget/4 points (mostly depth noise and far terrain around
+the scene: 300 of the 333 cells of Achapnyak v4; at half the voxel, 93 of v1's 109 tiles were
+cells under 1M points) are packed together, nearby cells first, into tiles of up to `budget`:
+the viewer holds every tile's root chunk in a 64K-splat page of a pool of 256, so hundreds of
+tiny tiles would crowd out detail. A small cell that grows is promoted to tiles of its own.
 
-Manifest (in version.metrics["dense_tiles"]): {"voxel", "budget", "stray": [top cells],
+Manifest (in version.metrics["dense_tiles"]): {"voxel", "budget", "small": {top cell: tile},
 "leaves": {"<top cell>/<level>_<x>_<y>_<z>": tile key}, "tiles": {key: {"dir", "points"}}};
-a tile is one big leaf, a pack of small leaves of one top cell, or "stray". Its dir (relative
-to the data root) holds cloud.ply and lod/splat-lod.rad.
+a tile is one big leaf, a pack of small leaves of one top cell, or a pack of small cells
+("small_<first cell>"). Its dir (relative to the data root) holds cloud.ply and
+lod/splat-lod.rad.
 """
 
 from __future__ import annotations
@@ -34,8 +37,6 @@ from worker.pipeline.lod import build_lod
 
 TOP_SHIFT = 12
 MIN_SHIFT = 6
-STRAY_POINTS = 10_000
-STRAY = "stray"
 POINT = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")])
 
 
@@ -164,7 +165,9 @@ def update_tiles(parent: dict | None, spill: Spill, out_dir: Path, root: Path, l
     voxel = spill.voxel
     tiles = dict(parent["tiles"]) if parent else {}
     leaf_tile = dict(parent["leaves"]) if parent else {}  # "<top>/<leaf>" -> tile key
-    stray_tops = set(parent["stray"]) if parent else set()
+    small_tops: dict[str, str] = {}  # small top cell -> its pack
+    if parent:  # versions before packs had one "stray" tile for every small cell
+        small_tops = dict(parent.get("small") or dict.fromkeys(parent.get("stray", []), "stray"))
     by_top: dict[str, dict[Leaf, str]] = defaultdict(dict)
     for name, tile in leaf_tile.items():
         top, leaf = name.split("/")
@@ -234,39 +237,56 @@ def update_tiles(parent: dict | None, spill: Spill, out_dir: Path, root: Path, l
             target = np.concatenate([old_target, target])
         retile(top, xyz, rgb, target)
 
-    stray_new: list[tuple[np.ndarray, np.ndarray]] = []
+    def whole(top: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
+        retile(top, xyz, rgb, np.tile([TOP_SHIFT, 0, 0, 0], (len(xyz), 1)))
+
+    small_new: list[tuple[np.ndarray, np.ndarray]] = []
     try:
         for top in spill.tops():
             xyz, rgb = spill.read(top)
             if by_top.get(top):
                 merge(top, xyz, rgb)
-            elif top in stray_tops:
-                stray_new.append((xyz, rgb))
+            elif top in small_tops:
+                small_new.append((xyz, rgb))
             else:
                 xyz, rgb = voxel_downsample(xyz, rgb, voxel)
-                if len(xyz) < STRAY_POINTS:
-                    stray_new.append((xyz, rgb))
-                    stray_tops.add(top)
+                if len(xyz) < budget // 4:
+                    small_new.append((xyz, rgb))
                 else:
-                    retile(top, xyz, rgb, np.tile([TOP_SHIFT, 0, 0, 0], (len(xyz), 1)))
+                    whole(top, xyz, rgb)
 
-        if stray_new:
-            old = [read(STRAY)] if STRAY in tiles else []
-            xyz = np.concatenate([p[0] for p in old + stray_new])
-            rgb = np.concatenate([p[1] for p in old + stray_new])
-            xyz, rgb = voxel_downsample(xyz, rgb, voxel)
+        if small_new:
+            # The packs holding any touched small cell are re-read and repacked with the new
+            # points; cells grown past budget/4 get tiles of their own.
+            touched = {small_tops[_name(t)] for xyz, _ in small_new
+                       for t in np.unique(_cells(xyz, voxel) >> TOP_SHIFT, axis=0) if _name(t) in small_tops}
+            old = [read(key) for key in sorted(touched)]
+            for key in touched:
+                del tiles[key]
+            for top in [t for t, key in small_tops.items() if key in touched]:
+                del small_tops[top]
+            xyz = np.concatenate([p[0] for p in old + small_new])
+            rgb = np.concatenate([p[1] for p in old + small_new])
             tops = _cells(xyz, voxel) >> TOP_SHIFT
-            keep = np.ones(len(xyz), bool)
+            cells = []
             for _, idx in _group(_pack(tops)):
-                if len(idx) >= STRAY_POINTS:  # grown into a cell of its own
-                    top = _name(tops[idx[0]])
-                    stray_tops.discard(top)
-                    retile(top, xyz[idx], rgb[idx], np.tile([TOP_SHIFT, 0, 0, 0], (len(idx), 1)))
-                    keep[idx] = False
-            if keep.any():
-                emit(STRAY, xyz[keep], rgb[keep])
-            else:
-                tiles.pop(STRAY, None)
+                top = _name(tops[idx[0]])
+                x, c = voxel_downsample(xyz[idx], rgb[idx], voxel)
+                if len(x) >= budget // 4:
+                    whole(top, x, c)
+                else:
+                    cells.append((tuple(int(v) for v in tops[idx[0]]), top, x, c))
+            cells.sort(key=lambda cell: cell[0])
+            while cells:
+                count, n = 0, 0
+                while n < len(cells) and (n == 0 or count + len(cells[n][2]) <= budget):
+                    count += len(cells[n][2])
+                    n += 1
+                pack, cells = cells[:n], cells[n:]
+                key = f"small_{pack[0][1]}"
+                emit(key, np.concatenate([p[2] for p in pack]), np.concatenate([p[3] for p in pack]))
+                for _, top, _, _ in pack:
+                    small_tops[top] = key
 
         for done, future in enumerate(futures, start=1):
             future.result()
@@ -275,7 +295,7 @@ def update_tiles(parent: dict | None, spill: Spill, out_dir: Path, root: Path, l
     finally:
         pool.shutdown(cancel_futures=True)
     leaves = {f"{top}/{_name(leaf)}": key for top, cells in by_top.items() for leaf, key in cells.items()}
-    return {"voxel": voxel, "budget": budget, "stray": sorted(stray_tops), "leaves": leaves, "tiles": tiles}
+    return {"voxel": voxel, "budget": budget, "small": small_tops, "leaves": leaves, "tiles": tiles}
 
 
 def _build(lod_bin: Path, tile_dir: Path) -> None:
