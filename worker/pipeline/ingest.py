@@ -296,8 +296,7 @@ def extract_keyframes(
 
     # Pass 1: per-candidate sharpness and motion on small grayscale frames, by segment.
     expected = max(int(info.duration * candidate_fps), 1)
-    ranges = _segments(expected, segments if pool else 1, int(min_segment_seconds * candidate_fps))
-    ranges[-1] = (ranges[-1][0], None)  # the last segment runs to the end of the video
+    ranges = sample_ranges(info, candidate_fps, segments if pool else 1, min_segment_seconds)
     analysed = [0]
     lock = threading.Lock()
 
@@ -341,22 +340,12 @@ def extract_keyframes(
     # Pass 2: decode just the chosen frames at full quality, from the same segment starts as
     # pass 1 so sample indices name the same frames.
     names = {p[0]: f"{prefix}{k:05d}.jpg" for k, p in enumerate(picked)}
-    written = [0]
 
-    def decode(first: int, last: int | None) -> None:
-        select = [p[0] for p in picked if p[0] >= first and (last is None or p[0] < last)]
-        if not select:
-            return
-        start = max(first - 1, 0)
-        count = None if last is None else last - start
-        for index, _, frame in iter_frames(info, candidate_fps, max_side, select=select, start=start, count=count):
-            cv2.imwrite(str(out_dir / names[index]), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            with lock:
-                written[0] += 1
-                if on_progress and written[0] % 10 == 0:
-                    on_progress(0.8 + 0.19 * written[0] / len(picked))
+    def written(done: int) -> None:
+        if on_progress and done % 10 == 0:
+            on_progress(0.8 + 0.19 * done / len(picked))
 
-    _run(pool, [lambda a=a, b=b: decode(a, b) for a, b in ranges])
+    decode_samples(info, names, out_dir, ranges, candidate_fps, max_side, pool, written)
     frames = [Frame(names[index], ts, score, holdout=False, motion=round(motion, 4))
               for index, ts, score, motion in picked]
     missing = [f.name for f in frames if not (out_dir / f.name).exists()]
@@ -365,3 +354,38 @@ def extract_keyframes(
     for k in range(holdout_every - 1, len(frames), holdout_every):
         frames[k].holdout = True
     return frames
+
+
+def sample_ranges(info: VideoInfo, candidate_fps: float, segments: int,
+                  min_segment_seconds: float = 20.0) -> list[tuple[int, int | None]]:
+    """The segments extract_keyframes decodes (the last runs to the end of the video). Sample
+    indices count from each segment's seek point, so decoding the same samples again (e.g.
+    at full resolution, worker.pipeline.splat.frames) must use the same segments."""
+    expected = max(int(info.duration * candidate_fps), 1)
+    ranges: list[tuple[int, int | None]] = list(_segments(expected, segments, int(min_segment_seconds * candidate_fps)))
+    ranges[-1] = (ranges[-1][0], None)
+    return ranges
+
+
+def decode_samples(info: VideoInfo, names: dict[int, str], out_dir: Path, ranges: list[tuple[int, int | None]],
+                   candidate_fps: float, max_side: int | None, pool: Executor | None = None,
+                   on_written: Callable[[int], None] | None = None) -> None:
+    """Write the samples `names` maps (sample index -> file name) as JPEGs, each segment of
+    `ranges` decoded by one ffmpeg."""
+    lock = threading.Lock()
+    written = [0]
+
+    def decode(first: int, last: int | None) -> None:
+        select = sorted(i for i in names if i >= first and (last is None or i < last))
+        if not select:
+            return
+        start = max(first - 1, 0)
+        count = None if last is None else last - start
+        for index, _, frame in iter_frames(info, candidate_fps, max_side, select=select, start=start, count=count):
+            cv2.imwrite(str(out_dir / names[index]), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            with lock:
+                written[0] += 1
+                if on_written:
+                    on_written(written[0])
+
+    _run(pool, [lambda a=a, b=b: decode(a, b) for a, b in ranges])

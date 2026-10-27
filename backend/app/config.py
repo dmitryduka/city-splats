@@ -38,6 +38,21 @@ UNIFORM_PIXELS = float(os.environ.get("UNIFORM_PIXELS", 2.0))
 # dropped as videos were added. 500 is about the first Achapnyak video alone (469 frames);
 # Achapnyak v5 (2805 frames) becomes 6 blocks. 0 trains globally.
 TRAIN_BLOCK_FRAMES = int(os.environ.get("TRAIN_BLOCK_FRAMES", 500))
+# Block training frames beyond the stored keyframes (worker.pipeline.splat.frames), all off by
+# default and set per scene (Scene.settings):
+# - TRAIN_SHARED_CAMERAS: one camera per video, re-posing frames of chunks whose intrinsics
+#   drifted (Achapnyak had 85 frames on cameras with fx/fy of 0.23 and 3.4).
+# - TRAIN_FRAME_SIDE: keyframes decoded again from the video at up to this many pixels (they
+#   are stored at 1920); the frames decode exactly (mean difference to the stored ones 2.7/255,
+#   21/255 for the next sample). A 4K video decodes in ~2.5 min on the M3.
+# - TRAIN_EXTRA_FRAMES: extra frames per gap between keyframes, posed from the neighbouring
+#   keyframes' SfM points (optical flow + PnP). Extra frames always use shared cameras.
+# - TRAIN_DENSE_INIT: points per block from the dense cloud as Brush's start (with the SfM
+#   points), instead of the SfM points alone.
+TRAIN_SHARED_CAMERAS = int(os.environ.get("TRAIN_SHARED_CAMERAS", 0))
+TRAIN_FRAME_SIDE = int(os.environ.get("TRAIN_FRAME_SIDE", 0))
+TRAIN_EXTRA_FRAMES = int(os.environ.get("TRAIN_EXTRA_FRAMES", 0))
+TRAIN_DENSE_INIT = int(os.environ.get("TRAIN_DENSE_INIT", 0))
 UNIFORM_INIT_POINTS = int(os.environ.get("UNIFORM_INIT_POINTS", 500_000))
 AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "none")
 TRAIN_PREVIEW_EVERY = int(os.environ.get("TRAIN_PREVIEW_EVERY", 1000))

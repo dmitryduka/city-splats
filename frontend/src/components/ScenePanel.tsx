@@ -18,6 +18,8 @@ const STAGE_LABELS: Record<string, string> = {
   register: "Fitting into scene",
   layers: "Exporting point layers",
   dense: "Dense point cloud",
+  frames: "Preparing training frames",
+  init: "Dense init",
   train: "Training splats",
   cleanup: "Removing floaters",
   lod: "Building LoD for streaming",
@@ -32,6 +34,11 @@ const STEP_LABELS: Record<string, string> = {
   map: "Mapping",
   submodel_merge: "Submodel fallback",
   gate: "Consistency check",
+  cameras: "One camera per video",
+  pick: "Pick extra frames",
+  decode: "Decode full-res frames",
+  pose: "Pose extra frames",
+  sample: "Read dense tiles",
 };
 
 function TimelineRow({ entry, label, nested }: { entry: TimelineEntry; label: string; nested?: boolean }) {
@@ -222,6 +229,52 @@ const TRAIN_OPTIONS: { quality: TrainQuality; label: string; title: string }[] =
   { quality: "full", label: "Full quality", title: "7000 steps at 1600 px; best quality, ~4x longer" },
 ];
 
+type BlockReport = { frames: number; train_frames: number; eval?: { psnr: number } | null; kept?: number };
+type FramesReport = {
+  keyframes: number;
+  full_resolution: number;
+  extra_candidates: number;
+  extra_posed: number;
+  extra_held_out: number;
+  reposed: number;
+  dropped: number;
+};
+type TrainReport = { frames?: FramesReport | null; blocks?: Record<string, BlockReport>; steps?: number; max_resolution?: number };
+
+/** What block training found: frames prepared (worker.pipeline.splat.frames) and each
+ * finished block's held-out PSNR; live while training, then from the splat metrics. */
+function TrainingReport({ report }: { report: TrainReport }) {
+  const f = report.frames;
+  const blocks = Object.entries(report.blocks ?? {});
+  const psnrs = blocks.map(([, b]) => b.eval?.psnr).filter((p): p is number => p != null);
+  const mean = psnrs.length ? psnrs.reduce((a, b) => a + b, 0) / psnrs.length : null;
+  return (
+    <div className="muted small report">
+      {f && (
+        <div>
+          Frames: {f.keyframes} keyframes{f.full_resolution ? " at full resolution" : ""}
+          {f.extra_candidates > 0 &&
+            ` · +${f.extra_posed} extra (${f.extra_candidates} picked, ${f.extra_held_out} skipped next to held-out frames)`}
+          {(f.reposed > 0 || f.dropped > 0) && ` · ${f.reposed} re-posed, ${f.dropped} dropped (bad camera)`}
+        </div>
+      )}
+      {report.steps != null && (
+        <div>
+          {report.steps} steps per block at {report.max_resolution} px
+        </div>
+      )}
+      {blocks.length > 0 && (
+        <div>
+          Held-out PSNR{mean != null && ` (mean ${mean.toFixed(2)} dB)`}:{" "}
+          {blocks
+            .map(([key, b]) => `${key} ${b.eval ? b.eval.psnr.toFixed(2) : "–"} (${b.train_frames} fr${b.kept ? `, ${(b.kept / 1e6).toFixed(1)}M splats` : ""})`)
+            .join(" · ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function VersionRow({
   v,
   state,
@@ -294,6 +347,7 @@ function VersionRow({
               </div>
               {v.train_detail && <div className="muted small">{v.train_detail}</div>}
               {v.train_timeline && v.train_timeline.length > 0 && <Timeline timeline={v.train_timeline} />}
+              {v.metrics.training_report != null && <TrainingReport report={v.metrics.training_report as TrainReport} />}
             </>
           )}
           <button className="small" onClick={() => api.cancelTraining(slug, v.id).catch((e) => onError(e.message))}>
@@ -314,6 +368,9 @@ function VersionRow({
             {!v.train_status && v.train_detail && ` ${v.train_detail}`}
           </span>
         </div>
+      )}
+      {!busy && (v.metrics.splat_full as TrainReport | undefined)?.blocks && (
+        <TrainingReport report={v.metrics.splat_full as TrainReport} />
       )}
     </li>
   );

@@ -4,7 +4,9 @@ publish) and train one version's splat (train -> remove floaters -> LoD)."""
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import shutil
 import time
@@ -18,6 +20,7 @@ from backend.app.config import (
     AUTO_TRAIN,
     BUILD_LOD_BIN,
     DATA_ROOT,
+    DECODE_THREADS,
     DEPTH_MODEL,
     DENSE_STRIDE,
     DENSE_TILE_POINTS,
@@ -29,7 +32,11 @@ from backend.app.config import (
     MIN_REGISTRATION_RATIO,
     SCENES_ROOT,
     TRAIN_BLOCK_FRAMES,
+    TRAIN_DENSE_INIT,
+    TRAIN_EXTRA_FRAMES,
+    TRAIN_FRAME_SIDE,
     TRAIN_PREVIEW_EVERY,
+    TRAIN_SHARED_CAMERAS,
     TRAIN_SETTINGS,
     UNIFORM_INIT_POINTS,
     UNIFORM_PIXELS,
@@ -50,7 +57,17 @@ from worker.pipeline.ingest import probe
 from worker.pipeline.lod import build_lod
 from worker.pipeline.pieces import Piece, apply, compose, link_piece
 from worker.pipeline.splat import Snapshot, TrainingStopped
-from worker.pipeline.splat.blocks import Block, block_model, crop_to_block, plan_blocks
+from worker.pipeline.splat.blocks import Block, block_init, block_model, crop_to_block, plan_blocks
+from worker.pipeline.splat.frames import (
+    FrameStats,
+    Video,
+    add_extra_frames,
+    candidates,
+    copy_poses,
+    decode_images,
+    plan_images,
+    shared_cameras,
+)
 from worker.pipeline.splat.brush import eval_results
 from worker.pipeline.tiles import Spill, lod_files, sample_cloud, update_tiles
 from worker.pipeline.uniform import uniform_init
@@ -417,22 +434,47 @@ def _train_global(v: Version, quality: str, steps: int, max_resolution: int, rec
                  "eval": eval_results(work / "train")}
 
 
-def _train_blocks(v: Version, quality: str, steps: int, max_resolution: int, reconstruction: Path,
+def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolution: int, reconstruction: Path,
                   rec: pycolmap.Reconstruction, image_root: Path, work: Path, progress: Progress,
                   timing: TimingModel, show_preview: Callable[[list[Path], int], None]) -> tuple[Path, dict]:
     """Each ground block trained on its own frames (worker.pipeline.splat.blocks), cropped to
     its cells, cleaned and built into its own LoD; returns the list of block LoDs. A block
-    whose frames and steps match the same block of an earlier version is reused."""
+    whose frames and steps match the same block of an earlier version is reused. Scene
+    settings can add training frames (worker.pipeline.splat.frames) and start each block
+    from the dense cloud."""
     geo = v.metrics["geo"]
     blocks = plan_blocks(rec, geo, TRAIN_BLOCK_FRAMES)
     plan = [(block, steps) for block in blocks]
     total = sum(n for _, n in plan)
     earlier = _earlier_blocks(v, quality)
-    # Held out: every 8th frame by name, as one global Brush run would hold out, so block and
-    # global splats are measured on the same unseen frames.
+    # Held out: every 8th keyframe by name, as one global Brush run would hold out, so block
+    # and global splats are measured on the same unseen frames.
     names = sorted(image.name for image in rec.images.values() if image.has_pose)
     held_out = set(names[::8])
     full = pycolmap.Reconstruction(reconstruction)
+
+    train_root, frames = image_root, None
+    if progress.has("frames"):
+        train_root = SCENES_ROOT / scene.slug / "train_images"
+        follows, frames = _training_frames(v, scene, full, rec, image_root, train_root, held_out, progress, timing)
+        for block in blocks:
+            mine = set(block.images)
+            block.images = sorted(block.images + [x for x, after in follows.items() if after in mine])
+    registered = {image.name for image in full.images.values() if image.has_pose}
+    report = {"frames": frames.as_dict() if frames else None, "blocks": {}, "steps": steps,
+              "max_resolution": max_resolution}
+    _report(v.id, report)
+
+    cloud, dense_init = None, scene_setting(scene.settings, "TRAIN_DENSE_INIT", TRAIN_DENSE_INIT)
+    if progress.has("init"):
+        manifest = v.metrics["dense_tiles"]
+        progress.start("init", substeps=[("sample", len(manifest["tiles"]))])
+        with progress.step("sample", len(manifest["tiles"])):
+            # Blocks overlap and differ in density; 4 per block's share leaves each enough.
+            cloud = sample_cloud(manifest, DATA_ROOT, 4 * dense_init * len(blocks), on_progress=progress.counts)
+        progress.finish()
+
+    progress.set_estimate("train", timing.estimate(f"train.{quality}", total))
     progress.start("train")
     done, rads, results = 0, [], {}
     for i, (block, n) in enumerate(plan, start=1):
@@ -444,7 +486,13 @@ def _train_blocks(v: Version, quality: str, steps: int, max_resolution: int, rec
             continue
         block_dir = work / block.key
         (block_dir / "model").mkdir(parents=True)
-        block_model(full, geo, block).write(block_dir / "model")
+        model = block_model(full, geo, block)
+        model.write(block_dir / "model")
+        init_ply, init = None, None
+        if cloud is not None:
+            progress.update(done / total, detail=f"Block {i}/{len(plan)} · writing its dense start")
+            init_ply = block_dir / "init.ply"
+            init = block_init(cloud, model, geo, block, dense_init, init_ply)
         snapshots: list[Path] = []
 
         def on_snapshot(s: Snapshot, block: Block = block, block_dir: Path = block_dir, i: int = i) -> None:
@@ -460,11 +508,13 @@ def _train_blocks(v: Version, quality: str, steps: int, max_resolution: int, rec
             while len(snapshots) > 2:
                 shutil.rmtree(snapshots.pop(0), ignore_errors=True)
 
+        eval_names = sorted(held_out & set(block.images) & registered)
         raw = compute.trainer().train(
-            image_root, block_dir / "model", block_dir / "train", n, max_resolution, None, TRAIN_PREVIEW_EVERY,
-            on_snapshot, should_stop=lambda: _training_should_stop(v.id),
-            eval_names=sorted(held_out & set(block.images)),
+            train_root, block_dir / "model", block_dir / "train", n, max_resolution, init_ply, TRAIN_PREVIEW_EVERY,
+            on_snapshot, should_stop=lambda: _training_should_stop(v.id), eval_names=eval_names,
         )
+        if init_ply is not None:
+            init_ply.unlink()
         kept = crop_to_block(raw, block_dir / "cropped.ply", geo, block, blocks)
         shutil.rmtree(block_dir / "train" / "exports", ignore_errors=True)
         stats = clean_splats(block_dir / "cropped.ply", block_model(rec, geo, block), block_dir / "splat.ply")
@@ -474,14 +524,99 @@ def _train_blocks(v: Version, quality: str, steps: int, max_resolution: int, rec
         evals = eval_results(block_dir / "train")
         results[block.key] = {
             "dir": rel(block_dir), "cells": block.cells, "grow": block.grow, "frames": len(block.core),
-            "train_frames": len(block.images), "eval_frames": len(held_out & set(block.images)), "steps": n,
-            "images_hash": block.images_hash, "eval": evals[-1] if evals else None, "kept": kept,
-            "cleanup": stats.as_dict(),
+            "train_frames": len(set(block.images) & registered) - len(eval_names), "eval_frames": len(eval_names),
+            "steps": n, "images_hash": block.images_hash, "eval": evals[-1] if evals else None, "kept": kept,
+            "cleanup": stats.as_dict(), **({"init": init} if init else {}),
         }
+        report["blocks"][block.key] = {k: results[block.key][k] for k in ("frames", "train_frames", "eval", "kept")}
+        _report(v.id, report)
         log.info("version %s block %s (%d/%d): %s", v.id, block.key, i, len(plan), results[block.key]["eval"])
     timing.record(f"train.{quality}", total, progress.finish())
     return _write_lod_list(rads, work / "tiles.json"), {
-        "block_frames": TRAIN_BLOCK_FRAMES, "steps_total": total, "blocks": results}
+        "block_frames": TRAIN_BLOCK_FRAMES, "steps_total": total, "blocks": results,
+        **({"frames": frames.as_dict()} if frames else {}), **({"dense_init": dense_init} if cloud is not None else {})}
+
+
+def _report(version_id: int, report: dict) -> None:
+    """What the running training has found so far (frames prepared, blocks finished), shown
+    under the version while it trains; replaced by the splat metrics when it ends."""
+    with session_scope() as session:
+        v = session.get(Version, version_id)
+        v.metrics = v.metrics | {"training_report": report}
+        session.add(v)
+        session.commit()
+
+
+def _videos(v: Version) -> list[Video]:
+    """The version's videos as named in its reconstruction: frames are c<id>/..., <id> being
+    the contribution that uploaded the video (stored as uploads/<id>_<file>; a cloned scene
+    keeps the original's names and files)."""
+    source = SCENES_ROOT / Path(v.reconstruction_path).parts[1] / "contributions"
+    with session_scope() as session:
+        contributions = [session.get(Contribution, i) for i in v.contribution_ids]
+    videos = []
+    for c in contributions:
+        prefix = "c" + Path(c.video_path).name.split("_", 1)[0]
+        frames = json.loads((source / prefix / "frames.json").read_text())
+        videos.append(Video(prefix, Path(c.video_path), frames, DECODE_THREADS))
+    return videos
+
+
+def _training_frames(v: Version, scene: Scene, full: pycolmap.Reconstruction, rec: pycolmap.Reconstruction,
+                     image_root: Path, train_root: Path, held_out: set[str], progress: Progress,
+                     timing: TimingModel) -> tuple[dict[str, str], FrameStats]:
+    """One camera per video, keyframes at full resolution and extra frames, per the scene's
+    settings (worker.pipeline.splat.frames). Changes `full` (and `rec`'s poses to match);
+    returns extra frame -> the keyframe it follows, and the stats."""
+    side = scene_setting(scene.settings, "TRAIN_FRAME_SIDE", TRAIN_FRAME_SIDE)
+    extra = scene_setting(scene.settings, "TRAIN_EXTRA_FRAMES", TRAIN_EXTRA_FRAMES)
+    videos = _videos(v)
+    stats = FrameStats(keyframes=sum(1 for im in full.images.values() if im.has_pose))
+    gaps = sum(len(video.frames) - 1 for video in videos) * extra
+    substeps = [("cameras", stats.keyframes)]
+    if side or extra:
+        substeps += [("pick", sum(candidates(video) for video in videos) if extra else 0),
+                     ("decode", (stats.keyframes if side else 0) + gaps)]
+    if extra:
+        substeps += [("pose", gaps)]
+    progress.start("frames", substeps=substeps)
+
+    with progress.step("cameras", stats.keyframes):
+        cameras = shared_cameras(full, stats)
+        copy_poses(full, rec)
+        progress.counts(stats.keyframes, stats.keyframes)
+
+    follows: dict[str, str] = {}
+    if side or extra:
+        lock, count = threading.Lock(), [0]
+
+        def tick(n: int, total: int) -> None:
+            with lock:
+                count[0] += n
+                progress.counts(min(count[0], total), total)
+
+        metas = {}
+        with ThreadPoolExecutor(DECODE_THREADS) as pool:
+            total = substeps[1][1]
+            with progress.step("pick", total):
+                for video in videos:
+                    metas[video.prefix] = plan_images(video, train_root / video.prefix, side, extra, pool,
+                                                      lambda n: tick(n, total))
+            todo = [m for m in metas.values() if not m["decoded"]]
+            total = sum((len(m["keyframes"]) if side else 0) + len(m["extras"]) for m in todo)
+            count[0] = 0
+            with progress.step("decode", total):
+                for video in videos:
+                    metas[video.prefix] = decode_images(video, metas[video.prefix], train_root / video.prefix,
+                                                        image_root, pool, lambda n: tick(n, total))
+        stats.full_resolution = stats.keyframes if side else 0
+        if extra:
+            with progress.step("pose", gaps):
+                follows = add_extra_frames(full, videos, metas, cameras, image_root, train_root, held_out, stats,
+                                           progress.counts)
+    progress.finish()
+    log.info("version %s training frames: %s", v.id, json.dumps(stats.as_dict()))
+    return follows, stats
 
 
 def _earlier_blocks(v: Version, quality: str) -> dict:
@@ -504,6 +639,7 @@ def train_version(version_id: int) -> None:
         scene = session.get(Scene, v.scene_id)
     quality = v.train_quality or "quick"
     steps, max_resolution = TRAIN_SETTINGS[quality]
+    steps = scene_setting(scene.settings, f"TRAIN_{quality.upper()}_STEPS", steps)
     max_resolution = scene_setting(scene.settings, f"TRAIN_{quality.upper()}_RES", max_resolution)
     # The frames live with the scene that made the reconstruction (a showcase scene such as
     # office-tsdf borrows another scene's reconstruction and has no images of its own).
@@ -515,7 +651,16 @@ def train_version(version_id: int) -> None:
 
     timing = TimingModel(compute.device())
     stages = [("train", timing.estimate(f"train.{quality}", steps))]
-    if not blocks:
+    if blocks:
+        # Rough until the stages start and know their counts.
+        keyframes = v.metrics.get("registered") or 1000
+        if any(scene_setting(scene.settings, name, default) for name, default in (
+                ("TRAIN_SHARED_CAMERAS", TRAIN_SHARED_CAMERAS), ("TRAIN_FRAME_SIDE", TRAIN_FRAME_SIDE),
+                ("TRAIN_EXTRA_FRAMES", TRAIN_EXTRA_FRAMES))):
+            stages.insert(0, ("frames", timing.estimate("frames.decode", 2 * keyframes)))
+        if scene_setting(scene.settings, "TRAIN_DENSE_INIT", TRAIN_DENSE_INIT) and v.metrics.get("dense_tiles"):
+            stages.insert(-1, ("init", timing.estimate("init.sample", len(v.metrics["dense_tiles"]["tiles"]))))
+    else:
         stages += [("cleanup", timing.estimate("cleanup", 1)), ("lod", timing.estimate("lod", 1))]
     progress = Progress(training_sink(v.id), stages, timing)
     previews: list[Path] = []
@@ -540,15 +685,15 @@ def train_version(version_id: int) -> None:
                 previews.pop(0).unlink(missing_ok=True)
 
         if blocks:
-            rad, details = _train_blocks(v, quality, steps, max_resolution, reconstruction, rec, image_root, work,
-                                         progress, timing, show_preview)
+            rad, details = _train_blocks(v, scene, quality, steps, max_resolution, reconstruction, rec, image_root,
+                                         work, progress, timing, show_preview)
         else:
             rad, details = _train_global(v, quality, steps, max_resolution, reconstruction, rec, image_root, work,
                                          progress, timing, show_preview)
 
         with session_scope() as session:
             v = session.get(Version, version_id)
-            v.metrics = v.metrics | {
+            v.metrics = {k: val for k, val in v.metrics.items() if k != "training_report"} | {
                 f"splat_{quality}": {
                     "steps": steps,
                     "max_resolution": max_resolution,

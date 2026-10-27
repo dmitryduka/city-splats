@@ -308,14 +308,17 @@ def lod_files(manifest: dict, root: Path) -> list[tuple[Path, int]]:
     return [(root / t["dir"] / "lod" / "splat-lod.rad", t["points"]) for t in manifest["tiles"].values()]
 
 
-def sample_cloud(manifest: dict, root: Path, count: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+def sample_cloud(manifest: dict, root: Path, count: int, seed: int = 0,
+                 on_progress: Callable[[int, int], None] | None = None) -> tuple[np.ndarray, np.ndarray]:
     """About `count` points drawn uniformly from all tiles, one tile in memory at a time."""
     total = sum(t["points"] for t in manifest["tiles"].values())
     rng = np.random.default_rng(seed)
     xyz, rgb = [], []
-    for tile in manifest["tiles"].values():
+    for i, tile in enumerate(manifest["tiles"].values(), start=1):
         x, c = read_points_ply(root / tile["dir"] / "cloud.ply")
         keep = rng.random(len(x)) < count / max(total, 1)
         xyz.append(x[keep])
         rgb.append(c[keep])
+        if on_progress:
+            on_progress(i, len(manifest["tiles"]))
     return np.concatenate(xyz), np.concatenate(rgb)

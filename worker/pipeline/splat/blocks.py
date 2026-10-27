@@ -154,6 +154,33 @@ def block_model(rec: pycolmap.Reconstruction, geo: dict, block: Block) -> pycolm
     return sub
 
 
+def block_init(cloud: tuple[np.ndarray, np.ndarray], model: pycolmap.Reconstruction, geo: dict, block: Block,
+               count: int, out_ply: Path, seed: int = 0) -> dict:
+    """Brush's starting points for a block: up to `count` dense-cloud points within its
+    margin, plus the block model's SfM points (Brush takes init.ply instead of the SfM
+    points, and the dense cloud has nothing beyond depth range, e.g. far hills). Brush sizes
+    them from their nearest neighbours."""
+    xyz, rgb = cloud
+    xy = _to_map(xyz, map_from_scene(geo))[:, :2]
+    near = np.flatnonzero(np.min([_rect_distance(xy, c) for c in block.cells], axis=0) <= block.grow)
+    near = np.random.default_rng(seed).permutation(near)[:count]
+    sfm = list(model.points3D.values())
+    points = np.concatenate([xyz[near], np.array([p.xyz for p in sfm]).reshape(-1, 3)]).astype(np.float32)
+    colors = np.concatenate([rgb[near], np.array([p.color for p in sfm]).reshape(-1, 3)]).astype(np.uint8)
+    rows = np.empty(len(points), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                        ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+    rows["x"], rows["y"], rows["z"] = points.T
+    rows["red"], rows["green"], rows["blue"] = colors.T
+    header = ("ply\nformat binary_little_endian 1.0\n"
+              f"element vertex {len(rows)}\n"
+              "property float x\nproperty float y\nproperty float z\n"
+              "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+    with open(out_ply, "wb") as f:
+        f.write(header.encode())
+        f.write(rows.tobytes())
+    return {"dense": int(len(near)), "sfm": len(sfm)}
+
+
 def crop_to_block(splat_ply: Path, out_ply: Path, geo: dict, block: Block, blocks: list[Block]) -> int:
     """Keep the splats nearest to this block's cells (inside them, or in empty space closer
     to them than to any other block's). Returns how many."""

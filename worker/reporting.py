@@ -27,6 +27,11 @@ STEP_LABELS = {
     "map_fisheye": "Mapping, fisheye lens",
     "submodel_merge": "Fitting via submodel (fallback)",
     "gate": "Consistency check",
+    "cameras": "One camera per video",
+    "pick": "Picking extra frames",
+    "decode": "Decoding full-resolution frames",
+    "pose": "Posing extra frames",
+    "sample": "Reading dense tiles",
 }
 
 

@@ -27,7 +27,9 @@ be reverted.
   uniform), with live previews while training; output is cleaned and built into a LoD as well.
   GPS scenes train in ground blocks of ~500 frames, each with the full steps, so quality per
   area doesn't drop as videos are added; each block is cropped to its area and streamed as
-  its own LoD.
+  its own LoD. Per-scene settings can train blocks on more than the SfM keyframes (extra
+  frames between them, keyframes decoded again at full resolution, one camera per video) and
+  start them from the dense cloud.
 - **Viewer.** three.js + [Spark](https://github.com/sparkjsdev/spark): dense cloud, splats,
   sparse points by video, camera positions, and, for GPS scenes, an OpenStreetMap or
   satellite map laid under the scene on the fitted ground plane.

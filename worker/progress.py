@@ -36,6 +36,11 @@ DEFAULT_RATES = {
     "train.quick": 0.12,  # per training step (brush-cli on Metal, 1024 px)
     "train.full": 0.2,  # per training step (1600 px)
     "train.uniform": 0.07,  # per training step (1024 px, 500k-point dense start)
+    "frames.cameras": 0.05,  # per keyframe (PnP)
+    "frames.pick": 0.004,  # per 15 fps candidate (sharpness pass over the video)
+    "frames.decode": 0.15,  # per frame decoded at full resolution
+    "frames.pose": 0.1,  # per extra frame (optical flow + PnP)
+    "init.sample": 1.5,  # per dense tile read
     "cleanup": 10.0,  # per run
     "lod": 20.0,  # per run
     "sfm.extract.aliked": 1.3,  # per frame
@@ -65,6 +70,8 @@ STAGE_LABELS = {
     "register": "Fitting into scene",
     "layers": "Exporting point layers",
     "dense": "Dense point cloud",
+    "frames": "Preparing training frames",
+    "init": "Sampling dense cloud for initialisation",
     "train": "Training splats",
     "cleanup": "Removing floaters",
     "lod": "Building LoD for streaming",
@@ -203,6 +210,9 @@ class Progress:
         self._ticker = threading.Thread(target=self._tick, daemon=True)
         self._ticker.start()
 
+    def has(self, stage: str) -> bool:
+        return any(s.name == stage for s in self.stages)
+
     def _get(self, name: str) -> _Part:
         return next(s for s in self.stages if s.name == name)
 
@@ -279,6 +289,15 @@ class Progress:
                 stage_name = self.stage.name if self.stage else ""
             self.timing.record(self._rate_key(stage_name, name), sub.units, sub.actual)
             self._write(force=True)
+
+    def counts(self, done: int, total: int) -> None:
+        """Counts for the running substep, for work counted in Python rather than parsed from
+        COLMAP's log."""
+        with self._lock:
+            if self.sub is None:
+                return
+            self.sub.done, self.sub.total, self.sub.count_at = done, total, self.sub.elapsed
+        self._write()
 
     def finish(self) -> float:
         with self._lock:
