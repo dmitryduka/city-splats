@@ -529,7 +529,9 @@ def train_version(version_id: int) -> None:
         removed = clean_sparse(rec)
 
         def show_preview(rads: list[Path], step: int) -> None:
-            preview = work / f"preview_{len(previews)}.json"
+            # Named by step, not by len(previews): that stops growing at 2 once old ones are
+            # dropped, so every later preview overwrote the one before and was then deleted.
+            preview = work / f"preview_{step}.json"
             _write_lod_list(rads, preview)
             _update_version(v.id, preview_url=files_url(preview), preview_step=step)
             previews.append(preview)
