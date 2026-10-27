@@ -39,8 +39,15 @@ TRAIN_PREVIEW_EVERY = int(os.environ.get("TRAIN_PREVIEW_EVERY", 1000))
 # Dense clouds: depth-map pixels sampled per keyframe (1 = every pixel of the network's
 # 518 x 924 output; 2 = every other pixel, ~4x fewer points and a 2x coarser voxel). Stride 1
 # gave the 4-part office 61M points, and rebuilding the whole-scene LoD took 3 h (v3) and
-# 14 h (v4) on the M3, so 2 stays the default until the LoD is tiled.
+# 14 h (v4) on the M3 (whole-scene LoD, before tiles).
 DENSE_STRIDE = int(os.environ.get("DENSE_STRIDE", 2))
+# Dense tiles (worker.pipeline.tiles) split above DENSE_TILE_POINTS points. Achapnyak v5
+# (121M points): 104 tiles at 4M, 150 at 2M, built in 2.5-4.5 min (one 3.9M-point tile LoD:
+# 20 s, 1 GB) instead of one whole-scene LoD that was still running after an hour, swapping.
+# Fewer tiles matter in the viewer: each holds at least one 64K-splat page of Spark's 256.
+# LOD_JOBS tile LoDs are built at once (build-lod --quick is mostly single-threaded).
+DENSE_TILE_POINTS = int(os.environ.get("DENSE_TILE_POINTS", 4_000_000))
+LOD_JOBS = int(os.environ.get("LOD_JOBS", os.cpu_count() or 4))
 
 # Work run ahead on queued videos (worker.prefetch): frame extraction for up to
 # INGEST_VIDEOS videos at once, decoding in up to DECODE_THREADS segments in total (one

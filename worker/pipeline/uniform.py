@@ -16,7 +16,6 @@ import pycolmap
 from PIL import Image
 from scipy.spatial import cKDTree
 
-from worker.pipeline.dense import read_points_ply
 
 
 def _shell(rec: pycolmap.Reconstruction, image_root: Path, radius: float, train_focal: float,
@@ -50,11 +49,12 @@ def _shell(rec: pycolmap.Reconstruction, image_root: Path, radius: float, train_
     return xyz, np.concatenate(rgb), np.full(len(xyz), scale)
 
 
-def uniform_init(cloud_ply: Path, rec: pycolmap.Reconstruction, image_root: Path, out_ply: Path,
-                 max_resolution: int, pixels: float = 2.0, num_points: int = 500_000,
+def uniform_init(cloud: tuple[np.ndarray, np.ndarray], rec: pycolmap.Reconstruction, image_root: Path,
+                 out_ply: Path, max_resolution: int, pixels: float = 2.0, num_points: int = 500_000,
                  shell_every: int = 4, shell_grid: tuple[int, int] = (27, 48)) -> dict:
-    """Write the starting PLY (xyz, rgb, log scales) and return stats."""
-    xyz, rgb = read_points_ply(cloud_ply)
+    """Write the starting PLY (xyz, rgb, log scales) from (a sample of) the dense cloud and
+    return stats."""
+    xyz, rgb = cloud
     keep = np.random.default_rng(0).permutation(len(xyz))[:num_points]
     xyz, rgb = xyz[keep], rgb[keep]
     camera = next(iter(rec.cameras.values()))

@@ -8,11 +8,11 @@ COLMAP's PatchMatch stereo needs CUDA, so on the Mac (and as the default everywh
 3. pixels are unprojected through the real camera model and kept only if neighbouring
    keyframes of the same video agree on the depth (rejects flying pixels at depth edges and
    frames where the network is wrong);
-4. the result is voxel-downsampled.
+4. the points are streamed into tiles (worker.pipeline.tiles), voxel-downsampled per tile.
 
 Incremental scenes: each contribution densifies only its own frames. Registration keeps
 existing frames fixed, so earlier contributions' dense points stay valid and a version's
-cloud is its parent's plus the new contribution's (merge_clouds).
+cloud is its parent's plus the new contribution's, changed only in the tiles it touches.
 """
 
 from __future__ import annotations
@@ -120,16 +120,10 @@ def _align(image: pycolmap.Image, camera: pycolmap.Camera, rec: pycolmap.Reconst
     return _Frame(image, camera, depth, (sx, sy), fit_error)
 
 
-def densify(rec: pycolmap.Reconstruction, image_root: Path, names: list[str], depth_dir: Path,
-            out_ply: Path, stride: int = 2, neighbours: tuple[int, ...] = (-4, -2, -1, 1, 2, 4),
-            min_agree: int = 2, tolerance: float = 0.06, max_fit_error: float = 0.2, workers: int = 6,
-            on_progress: Callable[[int, int], None] | None = None) -> DenseStats:
-    """Fuse depth maps of `names` (frames of one video, in capture order) into a coloured PLY.
-
-    Tolerances match the network's accuracy: per-frame fits to SfM depths are off by 4-7%
-    (median) on the office, so a 3% agreement test with neighbours 3-6 frames away threw away
-    most correct pixels. Office part 2 (78 frames): 0.8M points with (±3, ±6, 3%), 4.0M with
-    (±1, ±2, ±4, 6%), visibly filling walls, ceiling and floor without adding noise."""
+def align_frames(rec: pycolmap.Reconstruction, names: list[str], depth_dir: Path, stride: int = 2,
+                 max_fit_error: float = 0.2) -> tuple[dict[int, _Frame], float]:
+    """Frames of `names` (one video, in capture order) with metric depth, keyed by position,
+    and the median world size of one sampled pixel (the voxel size of a scene's first video)."""
     by_name = {im.name: im for im in rec.images.values() if im.has_pose}
     frames: dict[int, _Frame] = {}
     for k, name in enumerate(names):
@@ -140,8 +134,27 @@ def densify(rec: pycolmap.Reconstruction, image_root: Path, names: list[str], de
         frame = _align(image, rec.cameras[image.camera_id], rec, np.load(path))
         if frame is not None and frame.fit_error <= max_fit_error:
             frames[k] = frame
+    if not frames:
+        raise RuntimeError("no frame's depth could be fitted to the SfM points")
+    footprint = float(np.median([np.nanmedian(f.depth) * stride * f.scale[0] / f.camera.mean_focal_length()
+                                 for f in frames.values()]))
+    return frames, footprint
 
-    def fuse(k: int, frame: _Frame) -> tuple[np.ndarray, np.ndarray, float] | None:
+
+def fuse_frames(frames: dict[int, _Frame], image_root: Path, sink: Callable[[np.ndarray, np.ndarray], None],
+                stride: int = 2, neighbours: tuple[int, ...] = (-4, -2, -1, 1, 2, 4), min_agree: int = 2,
+                tolerance: float = 0.06, workers: int = 6,
+                on_progress: Callable[[int, int], None] | None = None) -> int:
+    """Unproject each frame's depth and pass the points its neighbours agree on to `sink`
+    (xyz float32, rgb uint8), in frame order; returns how many. Nothing accumulates here, so
+    memory doesn't grow with the length of the video.
+
+    Tolerances match the network's accuracy: per-frame fits to SfM depths are off by 4-7%
+    (median) on the office, so a 3% agreement test with neighbours 3-6 frames away threw away
+    most correct pixels. Office part 2 (78 frames): 0.8M points with (±3, ±6, 3%), 4.0M with
+    (±1, ±2, ±4, 6%), visibly filling walls, ceiling and floor without adding noise."""
+
+    def fuse(k: int, frame: _Frame) -> tuple[np.ndarray, np.ndarray] | None:
         depth = frame.depth
         h, w = depth.shape
         sx, sy = frame.scale
@@ -171,33 +184,24 @@ def densify(rec: pycolmap.Reconstruction, image_root: Path, names: list[str], de
         if not keep.any():
             return None
         rgb = np.asarray(Image.open(image_root / frame.image.name).convert("RGB").resize((w, h)))
-        # World size of one sampled pixel at this depth (for the voxel size).
-        footprint = np.median(z[keep]) * stride * sx / frame.camera.mean_focal_length()
-        return world[keep].astype(np.float32), rgb[v[keep], u[keep]], footprint
+        return world[keep].astype(np.float32), rgb[v[keep], u[keep]]
 
     # Frames fuse independently and numpy releases the GIL in the heavy parts; results are
-    # kept in frame order so the voxel downsampling picks the same points.
-    points, colors, footprints = [], [], []
+    # passed on in frame order so the voxel downsampling picks the same points.
+    count = 0
     with ThreadPoolExecutor(workers) as pool:
         for done, fused in enumerate(pool.map(fuse, frames.keys(), frames.values()), start=1):
             if fused is not None:
-                points.append(fused[0])
-                colors.append(fused[1])
-                footprints.append(fused[2])
+                sink(*fused)
+                count += len(fused[0])
             if on_progress:
                 on_progress(done, len(frames))
-
-    if not points:
+    if not count:
         raise RuntimeError("densification produced no consistent points")
-    xyz, rgb = np.concatenate(points), np.concatenate(colors)
-    voxel = float(np.median(footprints))
-    xyz, rgb = _voxel_downsample(xyz, rgb, voxel)
-    write_points_ply(out_ply, xyz, rgb)
-    return DenseStats(len(names), len(frames), len(xyz), voxel,
-                      float(np.median([f.fit_error for f in frames.values()])))
+    return count
 
 
-def _voxel_downsample(xyz: np.ndarray, rgb: np.ndarray, voxel: float) -> tuple[np.ndarray, np.ndarray]:
+def voxel_downsample(xyz: np.ndarray, rgb: np.ndarray, voxel: float) -> tuple[np.ndarray, np.ndarray]:
     """The first point in each voxel. Voxels are packed into one int64 key: np.unique over
     rows (axis=0) sorts them as byte strings, 12 s for 13M points vs ~1 s."""
     cells = np.floor(xyz / voxel).astype(np.int64)
@@ -233,22 +237,9 @@ def read_points_ply(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return np.stack([rows["x"], rows["y"], rows["z"]], 1), np.stack([rows["red"], rows["green"], rows["blue"]], 1)
 
 
-def merge_clouds(parent_ply: Path | None, new_ply: Path, out_ply: Path, voxel: float) -> int:
-    """A version's cloud: the parent's plus the new contribution's, deduplicated per voxel
-    (existing points win, so earlier geometry is stable across versions)."""
-    xyz, rgb = read_points_ply(new_ply)
-    if parent_ply is not None:
-        old_xyz, old_rgb = read_points_ply(parent_ply)
-        xyz, rgb = np.concatenate([old_xyz, xyz]), np.concatenate([old_rgb, rgb])
-    xyz, rgb = _voxel_downsample(xyz, rgb, voxel)
-    write_points_ply(out_ply, xyz, rgb)
-    return len(xyz)
-
-
-def cloud_as_splats(cloud_ply: Path, out_ply: Path, voxel: float, opacity: float = 0.98) -> int:
-    """The dense cloud as small opaque round splats (one per point, sized to the voxel), so
-    it streams through the same LoD pipeline and viewer as trained splats."""
-    xyz, rgb = read_points_ply(cloud_ply)
+def write_cloud_splats(path: Path, xyz: np.ndarray, rgb: np.ndarray, voxel: float, opacity: float = 0.98) -> None:
+    """A cloud as small opaque round splats (one per point, sized to the voxel), so it streams
+    through the same LoD pipeline and viewer as trained splats."""
     n = len(xyz)
     rows = np.concatenate([
         xyz.astype(np.float32),
@@ -261,5 +252,4 @@ def cloud_as_splats(cloud_ply: Path, out_ply: Path, voxel: float, opacity: float
              "rot_0", "rot_1", "rot_2", "rot_3", "f_dc_0", "f_dc_1", "f_dc_2"]
     header = ("ply\nformat binary_little_endian 1.0\n" f"element vertex {n}\n"
               + "".join(f"property float {p}\n" for p in props) + "end_header\n")
-    write_ply(out_ply, header, rows)
-    return n
+    write_ply(path, header, rows)

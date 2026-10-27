@@ -18,8 +18,11 @@ be reverted.
 - **Fitting into the scene.** A new video's model is matched against the nearest frames of
   the existing scene (retrieval, limited to frames within 200 m when both sides have GPS) and
   placed by a robust similarity transform from 3D-3D correspondences. Existing parts never move.
-- **Dense cloud.** Depth Anything V2 depth maps, scaled to the SfM points, fused into a
-  voxelized cloud and built into a streamed LoD (Spark `.rad`).
+- **Dense cloud, in tiles.** Depth Anything V2 depth maps, scaled to the SfM points, are fused
+  and streamed to disk by region, then merged into an octree of tiles on a global voxel grid.
+  A new video re-merges and rebuilds only the tiles it touches (in parallel, memory bounded by
+  a tile), and the viewer streams each tile as its own LoD (Spark `.rad`), all under one splat
+  budget.
 - **Splats.** [Brush](https://github.com/ArthurBrussee/brush) trains on request (quick / full /
   uniform), with live previews while training; output is cleaned and built into a LoD as well.
 - **Viewer.** three.js + [Spark](https://github.com/sparkjsdev/spark): dense cloud, splats,
@@ -86,5 +89,5 @@ splats, `1`–`4` view modes, `C` cameras, `K` splat kind, `M` map (street → s
 ## Status
 
 A working prototype, developed on an M3 MacBook (CPU SfM, Metal for depth and Brush).
-Known gaps: rigid placement leaves ~5–15 px of misalignment between videos; dense LoDs are
-rebuilt for the whole scene each version; QC gates are minimal.
+Known gaps: rigid placement leaves ~5–15 px of misalignment between videos; splat training
+is still over the whole scene (not per tile); QC gates are minimal.

@@ -4,12 +4,13 @@ import { PLYLoader } from "three/examples/jsm/loaders/PLYLoader.js";
 import { dyno, SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import { buildMap, type Geo, type MapStyle } from "./mapTiles";
 
-/** "dense" and "splats" both show the streamed mesh at splatUrl (a dense cloud is streamed
+/** "dense" and "splats" both show the streamed meshes at splatUrl (a dense cloud is streamed
  * as small splats); the points modes show the sparse PLY layers instead. */
 export type ViewMode = "dense" | "splats" | "points_source" | "points_rgb";
 
 type Props = {
-  /** URL of a (chunked) .rad LoD file; streamed via Spark's pager. Swapped in place on change. */
+  /** URL of a (chunked) .rad LoD file, or of a tile list (.json: {tiles: [{url}]}, one .rad per
+   * tile); streamed via Spark's pager. Swapped in place on change. */
   splatUrl: string | null;
   /** Directory URL with points_source.ply, points_rgb.ply and cameras.ply. */
   layersUrl: string | null;
@@ -37,7 +38,8 @@ type PointLayer = "points_source" | "points_rgb" | "cameras";
 
 type Context = {
   world: THREE.Group;
-  splats: SplatMesh | null;
+  /** One mesh, or one per tile; Spark picks LoD across all of them under one budget. */
+  splats: SplatMesh[];
   /** Shader uniform behind splatSize, shared by every mesh this viewer creates. */
   splatSize: dyno.DynoFloat<string>;
   points: Partial<Record<PointLayer, THREE.Points>>;
@@ -51,6 +53,22 @@ function sizeModifier(size: dyno.DynoFloat<string>) {
     const { scales } = dyno.splitGsplat(gsplat!).outputs;
     return { gsplat: dyno.combineGsplat({ gsplat, scales: dyno.mul(scales, size) }) };
   });
+}
+
+function disposeMeshes(meshes: SplatMesh[]) {
+  for (const mesh of meshes) {
+    mesh.removeFromParent();
+    mesh.dispose();
+  }
+}
+
+/** The .rad URLs behind splatUrl: itself, or a tile list's entries. */
+async function lodUrls(splatUrl: string): Promise<string[]> {
+  if (!new URL(splatUrl, location.href).pathname.endsWith(".json")) return [splatUrl];
+  const response = await fetch(splatUrl);
+  if (!response.ok) throw new Error(`${splatUrl}: ${response.status}`);
+  const { tiles } = (await response.json()) as { tiles: { url: string }[] };
+  return tiles.map((t) => t.url);
 }
 
 function disposePoints(points: THREE.Points | undefined) {
@@ -99,7 +117,7 @@ export function SplatViewer({
     const ctx = ctxRef.current;
     if (!ctx) return;
     const { mode, showCameras } = viewRef.current;
-    if (ctx.splats) ctx.splats.visible = mode === "dense" || mode === "splats";
+    for (const mesh of ctx.splats) mesh.visible = mode === "dense" || mode === "splats";
     if (ctx.points.points_source) ctx.points.points_source.visible = mode === "points_source";
     if (ctx.points.points_rgb) ctx.points.points_rgb.visible = mode === "points_rgb";
     if (ctx.points.cameras) ctx.points.cameras.visible = showCameras;
@@ -120,7 +138,7 @@ export function SplatViewer({
 
     const ctx: Context = {
       world: new THREE.Group(),
-      splats: null,
+      splats: [],
       splatSize: dyno.dynoFloat(splatSize),
       points: {},
       dirty: true,
@@ -169,7 +187,7 @@ export function SplatViewer({
       renderer.setAnimationLoop(null);
       observer.disconnect();
       const ctx = ctxRef.current;
-      ctx?.splats?.dispose();
+      ctx?.splats.forEach((mesh) => mesh.dispose());
       Object.values(ctx?.points ?? {}).forEach(disposePoints);
       ctxRef.current = null;
       renderer.dispose();
@@ -177,39 +195,41 @@ export function SplatViewer({
     };
   }, [pixelRatio, lodSplatScale]);
 
-  // Splat swap: add the new mesh, drop the old one once the new one is initialized.
+  // Splat swap: add the new meshes, drop the old ones once all new ones are initialized.
   useEffect(() => {
     const ctx = ctxRef.current;
     if (!ctx) return;
     if (!splatUrl) {
       // Nothing to show (e.g. a version without trained splats): don't keep the last one.
-      ctx.splats?.removeFromParent();
-      ctx.splats?.dispose();
-      ctx.splats = null;
+      disposeMeshes(ctx.splats);
+      ctx.splats = [];
       ctx.dirty = true;
       return;
     }
-    const previous = ctx.splats;
-    const next = new SplatMesh({ url: splatUrl, paged: true, objectModifier: sizeModifier(ctx.splatSize) });
-    next.visible = false;
-    next.opacity = opacityRef.current;
-    ctx.world.add(next);
     let cancelled = false;
-    next.initialized.then(() => {
-      if (cancelled) return;
-      ctx.splats = next;
-      applyVisibility();
-      if (previous) {
-        previous.removeFromParent();
-        previous.dispose();
-      }
-    });
+    let next: SplatMesh[] = [];
+    lodUrls(splatUrl)
+      .then((urls) => {
+        if (cancelled) return;
+        next = urls.map((url) => {
+          const mesh = new SplatMesh({ url, paged: true, objectModifier: sizeModifier(ctx.splatSize) });
+          mesh.visible = false;
+          mesh.opacity = opacityRef.current;
+          ctx.world.add(mesh);
+          return mesh;
+        });
+        return Promise.all(next.map((mesh) => mesh.initialized));
+      })
+      .then(() => {
+        if (cancelled) return;
+        disposeMeshes(ctx.splats);
+        ctx.splats = next;
+        applyVisibility();
+      })
+      .catch((error) => console.error("loading splats failed", error));
     return () => {
       cancelled = true;
-      if (ctx.splats !== next) {
-        next.removeFromParent();
-        next.dispose();
-      }
+      if (ctx.splats !== next) disposeMeshes(next);
     };
   }, [splatUrl, pixelRatio, lodSplatScale]);
 
@@ -252,7 +272,7 @@ export function SplatViewer({
     const ctx = ctxRef.current;
     if (!ctx || ctx.splatSize.value === splatSize) return;
     ctx.splatSize.value = splatSize;
-    ctx.splats?.updateVersion();
+    ctx.splats.forEach((mesh) => mesh.updateVersion());
     ctx.dirty = true;
   }, [splatSize]);
 
@@ -262,9 +282,11 @@ export function SplatViewer({
 
   useEffect(() => {
     const ctx = ctxRef.current;
-    if (!ctx?.splats || ctx.splats.opacity === splatOpacity) return;
-    ctx.splats.opacity = splatOpacity;
-    ctx.splats.updateVersion();
+    if (!ctx) return;
+    for (const mesh of ctx.splats) {
+      mesh.opacity = splatOpacity;
+      mesh.updateVersion();
+    }
     ctx.dirty = true;
   }, [splatOpacity]);
 

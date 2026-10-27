@@ -18,10 +18,12 @@ from backend.app.config import (
     BUILD_LOD_BIN,
     DATA_ROOT,
     DENSE_STRIDE,
+    DENSE_TILE_POINTS,
     LINK_CANDIDATE_STRIDE,
     LINK_NEIGHBORS,
     LINK_QUERY_STRIDE,
     LINK_RADIUS_M,
+    LOD_JOBS,
     MIN_REGISTRATION_RATIO,
     SCENES_ROOT,
     TRAIN_PREVIEW_EVERY,
@@ -35,7 +37,7 @@ from backend.app.models import Contribution, Scene, Version, utcnow
 from worker import compute
 from worker.pipeline.cleanup import clean_sparse, clean_splats, points_as_splats
 from worker.pipeline.dense import (
-    cloud_as_splats, densify, merge_clouds, predict_depth, read_points_ply, write_points_ply,
+    DenseStats, align_frames, fuse_frames, predict_depth,
 )
 from worker.pipeline.export import export_layers
 from worker.pipeline.georef import georeference
@@ -44,6 +46,7 @@ from worker.pipeline.ingest import probe
 from worker.pipeline.lod import build_lod
 from worker.pipeline.pieces import Piece, apply, compose, link_piece
 from worker.pipeline.splat import Snapshot, TrainingStopped
+from worker.pipeline.tiles import Spill, lod_files, sample_cloud, update_tiles
 from worker.pipeline.uniform import uniform_init
 from worker.prefetch import Prefetcher
 from worker.progress import Progress, TimingModel, contribution_sink, rel, training_sink
@@ -237,6 +240,9 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
             points_as_splats(rec, preview_dir / "splat.ply")
             dense_rad = build_lod(BUILD_LOD_BIN, preview_dir / "splat.ply", preview_dir / "lod", quality=False)
             metrics["dense_failed"] = True
+            # The next video still merges into the cloud the scene had before this one.
+            if head and "dense_tiles" in head.metrics:
+                metrics |= {k: head.metrics[k] for k in ("dense_tiles", "dense_voxel")}
         timing.record("dense", len(names), progress.finish())
 
         # 6. Publish a new version and move HEAD
@@ -273,9 +279,10 @@ def _await(job: tuple, progress: Progress, stage: str):
 def _densify(head: Version | None, rec: pycolmap.Reconstruction, image_root: Path, names: list[str],
              work: Path, metrics: dict, progress: Progress, depth_dir: Path | None = None,
              scene_from_piece: pycolmap.Sim3d | None = None) -> Path:
-    """Dense cloud for this contribution, merged with the parent's; returns the version's
-    cloud LoD. The scene keeps the first video's voxel size. Depth maps are predicted unless
-    `depth_dir` already holds them. `rec` is the video's piece, placed by scene_from_piece."""
+    """Dense cloud for this contribution, merged into the parent's tiles; returns the tile
+    list the viewer loads. The scene keeps the first video's voxel size. Depth maps are
+    predicted unless `depth_dir` already holds them. `rec` is the video's piece, placed by
+    scene_from_piece."""
     dense_dir = work / "dense"
     dense_dir.mkdir(exist_ok=True)
     if depth_dir is None:
@@ -283,29 +290,45 @@ def _densify(head: Version | None, rec: pycolmap.Reconstruction, image_root: Pat
         predict_depth(image_root, names, depth_dir,
                       on_progress=lambda done, total: progress.update(
                           0.6 * done / total, detail=f"Predicting depth {done}/{total}"))
-    stats = densify(rec, image_root, names, depth_dir, dense_dir / "contribution.ply", stride=DENSE_STRIDE,
-                    on_progress=lambda done, total: progress.update(
-                        0.6 + 0.2 * done / total, detail=f"Fusing depth maps {done}/{total}"))
+    frames, footprint = align_frames(rec, names, depth_dir, stride=DENSE_STRIDE)
+    parent = head.metrics.get("dense_tiles") if head else None
+    voxel = parent["voxel"] if parent else footprint * (scene_from_piece.scale if scene_from_piece else 1.0)
+    spill = Spill(dense_dir / "spill", voxel)
+
+    def sink(xyz: np.ndarray, rgb: np.ndarray) -> None:
+        spill.add(apply(scene_from_piece, xyz).astype(np.float32) if scene_from_piece else xyz, rgb)
+
+    fused = fuse_frames(frames, image_root, sink, stride=DENSE_STRIDE,
+                        on_progress=lambda done, total: progress.update(
+                            0.6 + 0.2 * done / total, detail=f"Fusing depth maps {done}/{total}"))
     shutil.rmtree(dense_dir / "depth", ignore_errors=True)
-    if scene_from_piece is not None:
-        xyz, rgb = read_points_ply(dense_dir / "contribution.ply")
-        write_points_ply(dense_dir / "contribution.ply", apply(scene_from_piece, xyz).astype(np.float32), rgb)
-        stats.voxel *= scene_from_piece.scale
-    parent_cloud = head.metrics.get("dense_cloud") if head else None
-    voxel = head.metrics.get("dense_voxel", stats.voxel) if head else stats.voxel
-    progress.update(0.8, detail="Merging into the scene cloud and building LoD")
-    total = merge_clouds(DATA_ROOT / parent_cloud if parent_cloud else None, dense_dir / "contribution.ply",
-                         dense_dir / "scene.ply", voxel)
-    splat_ply = dense_dir / "scene_splats.ply"
-    cloud_as_splats(dense_dir / "scene.ply", splat_ply, voxel)
-    rad = build_lod(BUILD_LOD_BIN, splat_ply, dense_dir / "lod", quality=False)
-    splat_ply.unlink()  # the LoD is what's served; scene.ply keeps the cloud itself
+    manifest = update_tiles(parent, spill, dense_dir / "tiles", DATA_ROOT, BUILD_LOD_BIN, DENSE_TILE_POINTS, LOD_JOBS,
+                            on_progress=lambda done, total: progress.update(
+                                0.8 + 0.2 * done / total, detail=f"Building tile LoDs {done}/{total}"))
+    shutil.rmtree(dense_dir / "spill", ignore_errors=True)
+    before = sum(t["points"] for t in parent["tiles"].values()) if parent else 0
+    total = sum(t["points"] for t in manifest["tiles"].values())
+    stats = DenseStats(len(names), len(frames), total - before, voxel,
+                       float(np.median([f.fit_error for f in frames.values()])))
     metrics |= {
-        "dense": stats.as_dict() | {"scene_points": total},
-        "dense_cloud": rel(dense_dir / "scene.ply"),
+        "dense": stats.as_dict() | {"scene_points": total, "fused_points": fused,
+                                    "tiles": len(manifest["tiles"]), "tiles_built": _tiles_built(parent, manifest)},
+        "dense_tiles": manifest,
         "dense_voxel": voxel,
     }
-    return rad
+    return write_tileset(manifest, dense_dir / "tiles.json")
+
+
+def _tiles_built(parent: dict | None, manifest: dict) -> int:
+    old = {t["dir"] for t in parent["tiles"].values()} if parent else set()
+    return sum(t["dir"] not in old for t in manifest["tiles"].values())
+
+
+def write_tileset(manifest: dict, path: Path) -> Path:
+    """The viewer's list of tile LoDs (each streamed as its own paged mesh)."""
+    path.write_text(json.dumps({"tiles": [{"url": files_url(rad), "points": points}
+                                          for rad, points in lod_files(manifest, DATA_ROOT)]}))
+    return path
 
 
 def _training_should_stop(version_id: int) -> bool:
@@ -371,10 +394,11 @@ def train_version(version_id: int) -> None:
         # a sky shell), each with a fixed on-screen size.
         init_ply, uniform = None, None
         if quality == "uniform":
-            if not v.metrics.get("dense_cloud"):
+            if not v.metrics.get("dense_tiles"):
                 raise RuntimeError("uniform splats need the version's dense point cloud")
             init_ply = work / "init.ply"
-            uniform = uniform_init(DATA_ROOT / v.metrics["dense_cloud"], rec, image_root, init_ply, max_resolution,
+            cloud = sample_cloud(v.metrics["dense_tiles"], DATA_ROOT, UNIFORM_INIT_POINTS)
+            uniform = uniform_init(cloud, rec, image_root, init_ply, max_resolution,
                                    pixels=UNIFORM_PIXELS, num_points=UNIFORM_INIT_POINTS)
 
         progress.start("train")

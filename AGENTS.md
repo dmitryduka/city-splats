@@ -10,7 +10,8 @@
   in subprocesses (`worker/pipeline/piece_job.py`).
 - `worker/pipeline/` stages are functions over directories: `ingest`, `sfm` (chunked mapping,
   GPS checks), `pieces` (linking a video into the scene and composing models), `dense`,
-  `depth_net`, `lod`, `cleanup`, `georef`, `splat/brush.py`, `devices/dji.py` (telemetry).
+  `depth_net`, `tiles` (the dense cloud as an octree of tiles, each with its own LoD), `lod`,
+  `cleanup`, `georef`, `splat/brush.py`, `devices/dji.py` (telemetry).
   `register.py` is the older merge path and is no longer called.
 - `frontend/src/App.tsx` holds the view state and keyboard shortcuts;
   `viewer/SplatViewer.tsx` renders (three.js + Spark, on-demand rendering);
