@@ -21,6 +21,8 @@ type Props = {
   lodSplatScale?: number;
   /** Multiplier on every splat's size (1 = as built/trained); for clouds and uniform splats. */
   splatSize?: number;
+  /** Opacity of the cloud/splats (1 = as built), e.g. to see the map underneath. */
+  splatOpacity?: number;
   onStats?: (stats: { fps: number }) => void;
   /** Where the scene lies on the map (from GPS), and which map to lay under it (null: none). */
   geo?: Geo | null;
@@ -71,6 +73,7 @@ export function SplatViewer({
   pixelRatio = 1,
   lodSplatScale = 1,
   splatSize = 1,
+  splatOpacity = 1,
   onStats,
   geo = null,
   mapStyle = null,
@@ -81,6 +84,8 @@ export function SplatViewer({
   const viewRef = useRef({ mode, showCameras });
   const onStatsRef = useRef(onStats);
   onStatsRef.current = onStats;
+  const opacityRef = useRef(splatOpacity);
+  opacityRef.current = splatOpacity;
   const onMapSourceRef = useRef(onMapSource);
   onMapSourceRef.current = onMapSource;
 
@@ -179,6 +184,7 @@ export function SplatViewer({
     const previous = ctx.splats;
     const next = new SplatMesh({ url: splatUrl, paged: true, objectModifier: sizeModifier(ctx.splatSize) });
     next.visible = false;
+    next.opacity = opacityRef.current;
     ctx.world.add(next);
     let cancelled = false;
     next.initialized.then(() => {
@@ -241,6 +247,14 @@ export function SplatViewer({
     ctx.splats?.updateVersion();
     ctx.dirty = true;
   }, [splatSize]);
+
+  useEffect(() => {
+    const ctx = ctxRef.current;
+    if (!ctx?.splats || ctx.splats.opacity === splatOpacity) return;
+    ctx.splats.opacity = splatOpacity;
+    ctx.splats.updateVersion();
+    ctx.dirty = true;
+  }, [splatOpacity]);
 
   useEffect(() => {
     viewRef.current = { mode, showCameras };

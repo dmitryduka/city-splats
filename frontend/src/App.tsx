@@ -54,6 +54,9 @@ export default function App() {
   const kindsRef = useRef<{ kinds: SplatKind[]; kind: SplatKind | null }>({ kinds: [], kind: null });
   const [showCameras, setShowCameras] = useState(false);
   const [mapStyle, setMapStyle] = useState<MapStyle | null>(null);
+  // Cloud/splat opacity, offered while a map is shown so it can show through. Applied cubed:
+  // many splats overlap along each ray, so per-splat opacity must drop fast to see through.
+  const [opacity, setOpacity] = useState(1);
   const [mapSource, setMapSource] = useState<{ attribution: string; failed: boolean } | null>(null);
   const geoRef = useRef<Geo | null>(null);
   const [fps, setFps] = useState(0);
@@ -189,6 +192,7 @@ export default function App() {
           pixelRatio={pixelRatio}
           lodSplatScale={lodSplatScale}
           splatSize={sizable ? sizes[surface] : 1}
+          splatOpacity={mapStyle && geo ? opacity ** 3 : 1}
           onStats={onStats}
           geo={geo}
           mapStyle={mapStyle}
@@ -256,6 +260,14 @@ export default function App() {
                 onChange={(e) => setSizes((s) => ({ ...s, [surface]: clampSize(Math.exp(Number(e.target.value))) }))}
               />
               <span>{sizes[surface].toFixed(2)}×</span>
+            </label>
+          )}
+          {mapStyle && geo && (mode === "dense" || mode === "splats") && (
+            <label className="size-slider" title="See the map through the scene">
+              opacity
+              <input type="range" min={0} max={1} step={0.01} value={opacity}
+                onChange={(e) => setOpacity(Number(e.target.value))} />
+              <span>{Math.round(opacity * 100)}%</span>
             </label>
           )}
           <div>
