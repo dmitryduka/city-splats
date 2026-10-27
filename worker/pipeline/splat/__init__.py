@@ -35,9 +35,10 @@ class Trainer(Protocol):
         should_stop: Callable[[], bool] = lambda: False,
         sh_degree: int = 3,
         freeze_scales: bool = False,
+        eval_names: list[str] | None = None,
     ) -> Path:
         """Train and return the final PLY. Calls on_snapshot for intermediate exports and
         raises TrainingStopped if should_stop() turns True (polled every few seconds).
         freeze_scales keeps the init PLY's per-splat sizes and never optimizes sizes or
-        rotations ("uniform" splats)."""
+        rotations ("uniform" splats). eval_names: frames held out for evaluation."""
         ...

@@ -1,3 +1,85 @@
+diff --git a/crates/brush-dataset/src/config.rs b/crates/brush-dataset/src/config.rs
+index 9c8c65f..45f15b5 100644
+--- a/crates/brush-dataset/src/config.rs
++++ b/crates/brush-dataset/src/config.rs
+@@ -34,6 +34,10 @@ pub struct LoadDatasetConfig {
+     /// Create an eval dataset by selecting every nth image
+     #[arg(long, help_heading = "Dataset Options")]
+     pub eval_split_every: Option<usize>,
++    /// File listing image names (one per line) to use as the eval dataset instead of
++    /// every nth image; the rest are train images.
++    #[arg(long, help_heading = "Dataset Options")]
++    pub eval_list: Option<std::path::PathBuf>,
+     /// Load only every nth frame
+     #[arg(long, help_heading = "Dataset Options")]
+     pub subsample_frames: Option<u32>,
+diff --git a/crates/brush-dataset/src/formats/colmap.rs b/crates/brush-dataset/src/formats/colmap.rs
+index 04627ec..7fc1eab 100644
+--- a/crates/brush-dataset/src/formats/colmap.rs
++++ b/crates/brush-dataset/src/formats/colmap.rs
+@@ -145,6 +145,7 @@ async fn load_dataset_inner(
+     // parse and the points3d parse run concurrently on the same thread
+     // (no cross-stream GPU concerns; this is pure CPU/I/O).
+     let actor = brush_async::Actor::new("colmap-loader");
++    let eval_list = load_args.eval_list.clone();
+     let dataset = actor.run(move || async move {
+         let mut cam_file = vfs.reader_at_path(&cam_path).await?;
+         let cam_model_data = colmap_reader::read_cameras(&mut cam_file, is_binary).await?;
+@@ -160,6 +161,7 @@ async fn load_dataset_inner(
+         log::info!("Loading {} images for colmap dataset", img_info_list.len());
+ 
+         let mut views = Vec::new();
++        let mut names = Vec::new();
+         let mut warnings = Vec::new();
+ 
+         for img_info in img_info_list
+@@ -219,9 +221,25 @@ async fn load_dataset_inner(
+             );
+ 
+             views.push(SceneView { camera, image });
++            names.push(img_info.name.clone());
+         }
+ 
+-        let (train_views, eval_views) = split_eval_every(views, load_args.eval_split_every);
++        let (train_views, eval_views) = if let Some(list) = &eval_list {
++            let text = std::fs::read_to_string(list).map_err(|e| {
++                FormatError::InvalidFormat(format!("Can't read eval list {}: {e}", list.display()))
++            })?;
++            let eval: std::collections::HashSet<&str> = text.lines().map(str::trim).collect();
++            let (eval_views, train_views): (Vec<_>, Vec<_>) = views
++                .into_iter()
++                .zip(names)
++                .partition(|(_, name)| eval.contains(name.as_str()));
++            (
++                train_views.into_iter().map(|(v, _)| v).collect(),
++                eval_views.into_iter().map(|(v, _)| v).collect(),
++            )
++        } else {
++            split_eval_every(views, load_args.eval_split_every)
++        };
+ 
+         Result::<_, FormatError>::Ok((Dataset::from_views(train_views, eval_views), warnings))
+     });
+@@ -472,6 +490,7 @@ mod tests {
+             subsample_points: None,
+             alpha_mode: None,
+             invert_masks: false,
++            eval_list: None,
+             units_per_meter: 1.0,
+             max_scene_batch_cache_size: 0,
+         }
+diff --git a/crates/brush-dataset/src/formats/nerfstudio.rs b/crates/brush-dataset/src/formats/nerfstudio.rs
+index 7d6a769..15a0308 100644
+--- a/crates/brush-dataset/src/formats/nerfstudio.rs
++++ b/crates/brush-dataset/src/formats/nerfstudio.rs
+@@ -445,6 +445,7 @@ mod tests {
+             subsample_points: None,
+             alpha_mode: None,
+             invert_masks: false,
++            eval_list: None,
+             units_per_meter: 1.0,
+             max_scene_batch_cache_size: 0,
+         };
 diff --git a/crates/brush-process/src/train_stream.rs b/crates/brush-process/src/train_stream.rs
 index abf9c0a..1d3b7c3 100644
 --- a/crates/brush-process/src/train_stream.rs

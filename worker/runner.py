@@ -4,6 +4,7 @@ publish) and train one version's splat (train -> remove floaters -> LoD)."""
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 import logging
 import shutil
 import time
@@ -26,6 +27,7 @@ from backend.app.config import (
     LOD_JOBS,
     MIN_REGISTRATION_RATIO,
     SCENES_ROOT,
+    TRAIN_BLOCK_FRAMES,
     TRAIN_PREVIEW_EVERY,
     TRAIN_SETTINGS,
     UNIFORM_INIT_POINTS,
@@ -46,6 +48,8 @@ from worker.pipeline.ingest import probe
 from worker.pipeline.lod import build_lod
 from worker.pipeline.pieces import Piece, apply, compose, link_piece
 from worker.pipeline.splat import Snapshot, TrainingStopped
+from worker.pipeline.splat.blocks import Block, block_model, block_steps, crop_to_block, plan_blocks
+from worker.pipeline.splat.brush import eval_results
 from worker.pipeline.tiles import Spill, lod_files, sample_cloud, update_tiles
 from worker.pipeline.uniform import uniform_init
 from worker.prefetch import Prefetcher
@@ -325,9 +329,13 @@ def _tiles_built(parent: dict | None, manifest: dict) -> int:
 
 
 def write_tileset(manifest: dict, path: Path) -> Path:
-    """The viewer's list of tile LoDs (each streamed as its own paged mesh)."""
-    path.write_text(json.dumps({"tiles": [{"url": files_url(rad), "points": points}
-                                          for rad, points in lod_files(manifest, DATA_ROOT)]}))
+    """The viewer's list of the dense tiles' LoDs."""
+    return _write_lod_list([rad for rad, _ in lod_files(manifest, DATA_ROOT)], path)
+
+
+def _write_lod_list(rads: list[Path], path: Path) -> Path:
+    """A list of LoDs the viewer streams together, each as its own paged mesh."""
+    path.write_text(json.dumps({"tiles": [{"url": files_url(rad)} for rad in rads]}))
     return path
 
 
@@ -355,9 +363,136 @@ def _update_version(version_id: int, **fields) -> None:
         session.commit()
 
 
+def _train_global(v: Version, quality: str, steps: int, max_resolution: int, reconstruction: Path,
+                  rec: pycolmap.Reconstruction, image_root: Path, work: Path, progress: Progress,
+                  timing: TimingModel, show_preview: Callable[[list[Path], int], None]) -> tuple[Path, dict]:
+    """One run over the whole scene; returns the LoD and details for the metrics."""
+    # Uniform splats can't grow to cover gaps, so they start from the dense cloud (plus
+    # a sky shell), each with a fixed on-screen size.
+    init_ply, uniform = None, None
+    if quality == "uniform":
+        if not v.metrics.get("dense_tiles"):
+            raise RuntimeError("uniform splats need the version's dense point cloud")
+        init_ply = work / "init.ply"
+        cloud = sample_cloud(v.metrics["dense_tiles"], DATA_ROOT, UNIFORM_INIT_POINTS)
+        uniform = uniform_init(cloud, rec, image_root, init_ply, max_resolution,
+                               pixels=UNIFORM_PIXELS, num_points=UNIFORM_INIT_POINTS)
+
+    progress.start("train")
+    snapshots: list[Path] = []
+
+    def on_snapshot(s: Snapshot) -> None:
+        progress.update(s.step / s.total_steps, detail=f"Step {s.step}/{s.total_steps}")
+        if s.step >= s.total_steps:
+            return
+        preview_dir = work / f"preview_{s.step}"
+        show_preview([build_lod(BUILD_LOD_BIN, s.ply_path, preview_dir, quality=False)], s.step)
+        snapshots.append(preview_dir)
+        while len(snapshots) > 2:
+            shutil.rmtree(snapshots.pop(0), ignore_errors=True)
+
+    raw_ply = compute.trainer().train(
+        image_root, reconstruction, work / "train", steps, max_resolution, init_ply, TRAIN_PREVIEW_EVERY,
+        on_snapshot, should_stop=lambda: _training_should_stop(v.id),
+        sh_degree=0 if uniform else 3, freeze_scales=uniform is not None,
+    )
+    timing.record(f"train.{quality}", steps, progress.finish())
+
+    progress.start("cleanup")
+    splat_ply = work / "splat.ply"
+    stats = clean_splats(raw_ply, rec, splat_ply)
+    shutil.rmtree(work / "train" / "exports", ignore_errors=True)
+    timing.record("cleanup", 1, progress.finish())
+
+    progress.start("lod")
+    rad = build_lod(BUILD_LOD_BIN, splat_ply, work / "lod", quality=True)
+    timing.record("lod", 1, progress.finish())
+    return rad, {**({"uniform": uniform} if uniform else {}), "cleanup": stats.as_dict(),
+                 "eval": eval_results(work / "train")}
+
+
+def _train_blocks(v: Version, quality: str, steps: int, max_resolution: int, reconstruction: Path,
+                  rec: pycolmap.Reconstruction, image_root: Path, work: Path, progress: Progress,
+                  timing: TimingModel, show_preview: Callable[[list[Path], int], None]) -> tuple[Path, dict]:
+    """Each ground block trained on its own frames (worker.pipeline.splat.blocks), cropped to
+    its cells, cleaned and built into its own LoD; returns the list of block LoDs. A block
+    whose frames and steps match the same block of an earlier version is reused."""
+    geo = v.metrics["geo"]
+    blocks = plan_blocks(rec, geo, TRAIN_BLOCK_FRAMES)
+    plan = [(block, block_steps(block, TRAIN_BLOCK_FRAMES, steps)) for block in blocks]
+    total = sum(n for _, n in plan)
+    earlier = _earlier_blocks(v, quality)
+    # Held out: every 8th frame by name, as one global Brush run would hold out, so block and
+    # global splats are measured on the same unseen frames.
+    names = sorted(image.name for image in rec.images.values() if image.has_pose)
+    held_out = set(names[::8])
+    full = pycolmap.Reconstruction(reconstruction)
+    progress.start("train")
+    done, rads, results = 0, [], {}
+    for i, (block, n) in enumerate(plan, start=1):
+        old = earlier.get(block.key)
+        if old and old["images_hash"] == block.images_hash and old["steps"] == n:
+            rads.append(DATA_ROOT / old["dir"] / "lod" / "splat-lod.rad")
+            results[block.key] = old | {"reused": True}
+            done += n
+            continue
+        block_dir = work / block.key
+        (block_dir / "model").mkdir(parents=True)
+        block_model(full, geo, block).write(block_dir / "model")
+        snapshots: list[Path] = []
+
+        def on_snapshot(s: Snapshot, block: Block = block, block_dir: Path = block_dir, i: int = i) -> None:
+            progress.update((done + s.step) / total, detail=f"Block {i}/{len(plan)} · step {s.step}/{s.total_steps}")
+            if s.step >= s.total_steps:
+                return
+            preview_dir = block_dir / f"preview_{s.step}"
+            preview_dir.mkdir()
+            crop_to_block(s.ply_path, preview_dir / "splat.ply", geo, block, blocks)
+            show_preview(rads + [build_lod(BUILD_LOD_BIN, preview_dir / "splat.ply", preview_dir / "lod",
+                                           quality=False)], done + s.step)
+            snapshots.append(preview_dir)
+            while len(snapshots) > 2:
+                shutil.rmtree(snapshots.pop(0), ignore_errors=True)
+
+        raw = compute.trainer().train(
+            image_root, block_dir / "model", block_dir / "train", n, max_resolution, None, TRAIN_PREVIEW_EVERY,
+            on_snapshot, should_stop=lambda: _training_should_stop(v.id),
+            eval_names=sorted(held_out & set(block.images)),
+        )
+        kept = crop_to_block(raw, block_dir / "cropped.ply", geo, block, blocks)
+        shutil.rmtree(block_dir / "train" / "exports", ignore_errors=True)
+        stats = clean_splats(block_dir / "cropped.ply", block_model(rec, geo, block), block_dir / "splat.ply")
+        (block_dir / "cropped.ply").unlink()
+        rads.append(build_lod(BUILD_LOD_BIN, block_dir / "splat.ply", block_dir / "lod", quality=True))
+        done += n
+        evals = eval_results(block_dir / "train")
+        results[block.key] = {
+            "dir": rel(block_dir), "cells": block.cells, "grow": block.grow, "frames": len(block.core),
+            "train_frames": len(block.images), "eval_frames": len(held_out & set(block.images)), "steps": n,
+            "images_hash": block.images_hash, "eval": evals[-1] if evals else None, "kept": kept,
+            "cleanup": stats.as_dict(),
+        }
+        log.info("version %s block %s (%d/%d): %s", v.id, block.key, i, len(plan), results[block.key]["eval"])
+    timing.record(f"train.{quality}", total, progress.finish())
+    return _write_lod_list(rads, work / "tiles.json"), {
+        "block_frames": TRAIN_BLOCK_FRAMES, "steps_total": total, "blocks": results}
+
+
+def _earlier_blocks(v: Version, quality: str) -> dict:
+    """Blocks of the nearest earlier version trained in blocks at this quality."""
+    with session_scope() as session:
+        parent = session.get(Version, v.parent_id) if v.parent_id else None
+        while parent is not None:
+            blocks = parent.metrics.get(f"splat_{quality}", {}).get("blocks")
+            if blocks:
+                return blocks
+            parent = session.get(Version, parent.parent_id) if parent.parent_id else None
+    return {}
+
+
 def train_version(version_id: int) -> None:
     """Train the version's splat at its requested quality, remove floaters, build the LoD
-    and swap it in."""
+    and swap it in. GPS scenes train in ground blocks (_train_blocks), others in one run."""
     with session_scope() as session:
         v = session.get(Version, version_id)
         scene = session.get(Scene, v.scene_id)
@@ -366,20 +501,16 @@ def train_version(version_id: int) -> None:
     # The frames live with the scene that made the reconstruction (a showcase scene such as
     # office-tsdf borrows another scene's reconstruction and has no images of its own).
     image_root = SCENES_ROOT / Path(v.reconstruction_path).parts[1] / "images"
-    work = SCENES_ROOT / scene.slug / "versions" / f"v{v.number}" / quality
+    blocks = quality != "uniform" and TRAIN_BLOCK_FRAMES > 0 and bool(v.metrics.get("geo"))
+    work = SCENES_ROOT / scene.slug / "versions" / f"v{v.number}" / (f"{quality}_blocks" if blocks else quality)
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
 
     timing = TimingModel(compute.device())
-    progress = Progress(
-        training_sink(v.id),
-        [
-            ("train", timing.estimate(f"train.{quality}", steps)),
-            ("cleanup", timing.estimate("cleanup", 1)),
-            ("lod", timing.estimate("lod", 1)),
-        ],
-        timing,
-    )
+    stages = [("train", timing.estimate(f"train.{quality}", steps))]
+    if not blocks:
+        stages += [("cleanup", timing.estimate("cleanup", 1)), ("lod", timing.estimate("lod", 1))]
+    progress = Progress(training_sink(v.id), stages, timing)
     previews: list[Path] = []
     started = time.time()
     try:
@@ -390,47 +521,21 @@ def train_version(version_id: int) -> None:
         rec = pycolmap.Reconstruction(reconstruction)
         removed = clean_sparse(rec)
 
-        # Uniform splats can't grow to cover gaps, so they start from the dense cloud (plus
-        # a sky shell), each with a fixed on-screen size.
-        init_ply, uniform = None, None
-        if quality == "uniform":
-            if not v.metrics.get("dense_tiles"):
-                raise RuntimeError("uniform splats need the version's dense point cloud")
-            init_ply = work / "init.ply"
-            cloud = sample_cloud(v.metrics["dense_tiles"], DATA_ROOT, UNIFORM_INIT_POINTS)
-            uniform = uniform_init(cloud, rec, image_root, init_ply, max_resolution,
-                                   pixels=UNIFORM_PIXELS, num_points=UNIFORM_INIT_POINTS)
-
-        progress.start("train")
-
-        def on_snapshot(s: Snapshot) -> None:
-            progress.update(s.step / s.total_steps, detail=f"Step {s.step}/{s.total_steps}")
-            if s.step >= s.total_steps:
-                return
-            preview_dir = work / f"preview_{s.step}"
-            rad = build_lod(BUILD_LOD_BIN, s.ply_path, preview_dir, quality=False)
-            _update_version(v.id, preview_url=files_url(rad), preview_step=s.step)
-            previews.append(preview_dir)
+        def show_preview(rads: list[Path], step: int) -> None:
+            preview = work / f"preview_{len(previews)}.json"
+            _write_lod_list(rads, preview)
+            _update_version(v.id, preview_url=files_url(preview), preview_step=step)
+            previews.append(preview)
             # Keep the latest two so a client mid-stream on the previous one doesn't 404.
             while len(previews) > 2:
-                shutil.rmtree(previews.pop(0), ignore_errors=True)
+                previews.pop(0).unlink(missing_ok=True)
 
-        raw_ply = compute.trainer().train(
-            image_root, reconstruction, work / "train", steps, max_resolution, init_ply, TRAIN_PREVIEW_EVERY,
-            on_snapshot, should_stop=lambda: _training_should_stop(v.id),
-            sh_degree=0 if uniform else 3, freeze_scales=uniform is not None,
-        )
-        timing.record(f"train.{quality}", steps, progress.finish())
-
-        progress.start("cleanup")
-        splat_ply = work / "splat.ply"
-        stats = clean_splats(raw_ply, rec, splat_ply)
-        shutil.rmtree(work / "train" / "exports", ignore_errors=True)
-        timing.record("cleanup", 1, progress.finish())
-
-        progress.start("lod")
-        rad = build_lod(BUILD_LOD_BIN, splat_ply, work / "lod", quality=True)
-        timing.record("lod", 1, progress.finish())
+        if blocks:
+            rad, details = _train_blocks(v, quality, steps, max_resolution, reconstruction, rec, image_root, work,
+                                         progress, timing, show_preview)
+        else:
+            rad, details = _train_global(v, quality, steps, max_resolution, reconstruction, rec, image_root, work,
+                                         progress, timing, show_preview)
 
         with session_scope() as session:
             v = session.get(Version, version_id)
@@ -438,19 +543,18 @@ def train_version(version_id: int) -> None:
                 f"splat_{quality}": {
                     "steps": steps,
                     "max_resolution": max_resolution,
-                    **({"uniform": uniform} if uniform else {}),
                     "sparse_points_removed": removed,
-                    "cleanup": stats.as_dict(),
+                    **details,
                     "seconds": round(time.time() - started, 1),
                 },
             }
-            v.splat_path, v.splat_url, v.splat_kind = rel(splat_ply), files_url(rad), quality
+            v.splat_path, v.splat_url, v.splat_kind = rel(rad), files_url(rad), quality
             v.splats = v.splats | {quality: v.splat_url}
             v.train_status = v.train_detail = v.preview_url = v.preview_step = None
             v.train_progress, v.train_eta, v.updated_at = 1.0, 0.0, utcnow()
             session.add(v)
             session.commit()
-        log.info("version %s: %s splat published (%s)", version_id, quality, stats.as_dict())
+        log.info("version %s: %s splat published", version_id, quality)
     except TrainingStopped:
         with session_scope() as session:
             v = session.get(Version, version_id)
@@ -463,5 +567,7 @@ def train_version(version_id: int) -> None:
         log.info("version %s training %s", version_id, "cancelled" if cancelled else "paused")
     finally:
         progress.close()
-        for preview_dir in previews:
+        for preview in previews:
+            preview.unlink(missing_ok=True)
+        for preview_dir in work.glob("**/preview_*"):
             shutil.rmtree(preview_dir, ignore_errors=True)

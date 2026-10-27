@@ -25,6 +25,9 @@ be reverted.
   budget.
 - **Splats.** [Brush](https://github.com/ArthurBrussee/brush) trains on request (quick / full /
   uniform), with live previews while training; output is cleaned and built into a LoD as well.
+  GPS scenes train in ground blocks of up to ~500 frames, each on its own frames with steps
+  scaled to them, so quality per area doesn't drop as videos are added; each block is cropped
+  to its area and streamed as its own LoD.
 - **Viewer.** three.js + [Spark](https://github.com/sparkjsdev/spark): dense cloud, splats,
   sparse points by video, camera positions, and, for GPS scenes, an OpenStreetMap or
   satellite map laid under the scene on the fitted ground plane.
@@ -55,11 +58,11 @@ uv venv --python 3.12 && uv sync
 # COLMAP + pycolmap with ONNX (ALIKED/LightGlue); applies infra/patches/colmap-*.patch
 infra/build_colmap.sh
 
-# Brush (splat training), with the fixed/frozen-scale patch
+# Brush (splat training), patched for fixed/frozen scales and a chosen eval split (needs Rust 1.95)
 git clone https://github.com/ArthurBrussee/brush tools/brush-src
 git -C tools/brush-src checkout 1388f74c6fe0236f68ee4915564bf00e9d2e3747
-git -C tools/brush-src apply ../../infra/patches/brush-fixed-and-frozen-scales.patch
-(cd tools/brush-src && cargo build --release -p brush-cli)
+git -C tools/brush-src apply ../../infra/patches/brush-local.patch
+(cd tools/brush-src && cargo +1.95 build --release -p brush-cli)
 
 # Spark's build-lod (LoD files for the viewer)
 git clone https://github.com/sparkjsdev/spark tools/spark
@@ -89,5 +92,5 @@ splats, `1`–`4` view modes, `C` cameras, `K` splat kind, `M` map (street → s
 ## Status
 
 A working prototype, developed on an M3 MacBook (CPU SfM, Metal for depth and Brush).
-Known gaps: rigid placement leaves ~5–15 px of misalignment between videos; splat training
-is still over the whole scene (not per tile); QC gates are minimal.
+Known gaps: rigid placement leaves ~5–15 px of misalignment between videos; scenes without
+GPS still train splats in one run; QC gates are minimal.

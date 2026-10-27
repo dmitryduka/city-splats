@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -13,6 +14,15 @@ from pathlib import Path
 from . import Snapshot, TrainingStopped
 
 _EXPORT_RE = re.compile(r"splat_(\d+)\.ply$")
+_EVAL_RE = re.compile(r"Eval iter (\d+): PSNR ([\d.]+), ssim ([\d.]+)")
+
+
+def eval_results(work_dir: Path) -> list[dict]:
+    """Brush's evaluations on its held-out frames, in step order."""
+    log = work_dir / "brush.log"
+    text = log.read_text(errors="replace") if log.exists() else ""
+    return [{"step": int(m[1]), "psnr": round(float(m[2]), 3), "ssim": round(float(m[3]), 4)}
+            for m in _EVAL_RE.finditer(text)]
 
 
 @cache
@@ -41,7 +51,10 @@ class BrushTrainer:
         should_stop: Callable[[], bool] = lambda: False,
         sh_degree: int = 3,
         freeze_scales: bool = False,
+        eval_names: list[str] | None = None,
     ) -> Path:
+        """Trains and returns the final export. Frames in `eval_names` are held out and
+        evaluated on (eval_results); otherwise every 8th frame by name."""
         # Brush wants a COLMAP dataset dir: images/, sparse/0/, and optionally a .ply that
         # it uses as initialization (warm start from the previous version's splat).
         dataset = work_dir / "dataset"
@@ -64,7 +77,6 @@ class BrushTrainer:
             str(self.binary.resolve()),
             str(dataset.resolve()),
             _steps_flag(self.binary.resolve()), str(steps),
-            "--eval-split-every", "8",
             "--export-every", str(min(snapshot_every, steps)),
             "--export-path", str(export_dir.resolve()),
             "--export-name", "splat_{iter}.ply",
@@ -73,8 +85,15 @@ class BrushTrainer:
         ]
         if freeze_scales:
             cmd.append("--freeze-scales")
+        if eval_names is not None:
+            (work_dir / "eval.txt").write_text("\n".join(eval_names))
+            cmd += ["--eval-list", str((work_dir / "eval.txt").resolve())]
+        else:
+            cmd += ["--eval-split-every", "8"]
         log = open(work_dir / "brush.log", "w")
-        proc = subprocess.Popen(cmd, cwd=cache_dir, stdout=log, stderr=subprocess.STDOUT)
+        # Eval results are logged at info level.
+        env = os.environ | {"RUST_LOG": "brush_cli=info"}
+        proc = subprocess.Popen(cmd, cwd=cache_dir, stdout=log, stderr=subprocess.STDOUT, env=env)
 
         seen: set[int] = set()
 
