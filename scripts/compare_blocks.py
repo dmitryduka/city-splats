@@ -2,7 +2,10 @@
 trained splat, on the same held-out frames (neither trained on them). The global splat is
 measured by a 1-step Brush run warm-started from it on each block's dataset.
 
-  python -m scripts.compare_blocks <version-id> [quality]
+  python -m scripts.compare_blocks <version-id> [quality] [global splat.ply]
+
+The global splat defaults to the version's own <quality>/splat.ply (a version trained both
+ways, e.g. in a scene cloned with scripts.clone_scene, passes the original's).
 """
 
 from __future__ import annotations
@@ -26,7 +29,8 @@ def main() -> None:
         scene = session.get(Scene, v.scene_id)
     blocks = v.metrics[f"splat_{quality}"]["blocks"]
     image_root = SCENES_ROOT / Path(v.reconstruction_path).parts[1] / "images"
-    global_ply = SCENES_ROOT / scene.slug / "versions" / f"v{v.number}" / quality / "splat.ply"
+    global_ply = (Path(sys.argv[3]) if len(sys.argv) > 3
+                  else SCENES_ROOT / scene.slug / "versions" / f"v{v.number}" / quality / "splat.ply")
     out = SCENES_ROOT / scene.slug / "versions" / f"v{v.number}" / f"{quality}_compare"
     _, max_resolution = TRAIN_SETTINGS[quality]
     rows = []
