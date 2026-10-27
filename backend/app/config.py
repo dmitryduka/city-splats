@@ -94,3 +94,6 @@ def scene_setting(scene_settings: dict | None, name: str, default):
     (Scene.settings), so scenes can be processed differently side by side."""
     value = (scene_settings or {}).get(name)
     return default if value is None else type(default)(value)
+
+# Opt-in GPU voxel hierarchy; spark preserves upstream quick/quality LoD behavior.
+LOD_BACKEND = os.environ.get("LOD_BACKEND", "spark")

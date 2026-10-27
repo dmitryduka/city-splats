@@ -17,5 +17,8 @@ dependencies = [
   "python-multipart>=0.0.32",
 ]
 
+[project.optional-dependencies]
+cuda-lod = ["cupy-cuda12x>=14,<15", "plyfile"]
+
 [tool.uv]
 package = false

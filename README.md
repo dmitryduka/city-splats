@@ -94,3 +94,21 @@ splats, `1`–`4` view modes, `C` cameras, `K` splat kind, `M` map (street → s
 A working prototype, developed on an M3 MacBook (CPU SfM, Metal for depth and Brush).
 Known gaps: rigid placement leaves ~5–15 px of misalignment between videos; scenes without
 GPS still train splats in one run; QC gates are minimal.
+
+
+### Optional CUDA voxel LoD
+
+Install `uv sync --extra cuda-lod` on a CUDA 12 system, then set
+`LOD_BACKEND=cuda_voxel`. The default `spark` backend keeps upstream's `--quick`
+for dense tiles and `--quality` for trained splats. The CUDA backend retains the
+original leaf geometry and spherical harmonics and builds coarser nodes by voxel
+grouping. Its parent hierarchy differs from both Spark builders; compare coarse
+views before adopting it. It writes native chunked RAD files and `cuda-lod.json`.
+Tile LoD jobs serialize on the GPU to bound peak VRAM; CPU tile preparation stays
+parallel. There is no silent fallback when CUDA is explicitly selected.
+
+The measured DJI_0327 dense-stage result (1,899.3 s to 141.4 s) compared our old
+whole-cloud, default-quality baseline with the CUDA pipeline. Current upstream
+already uses tiled clouds and explicit `--quick`; that 13.4x figure is **not** a
+speedup measured against this main revision. Both old runs decoded the video and
+recomputed depth/SfM, with 1,013 frames and about 49 million output points.
