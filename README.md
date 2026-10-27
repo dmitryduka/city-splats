@@ -25,9 +25,9 @@ be reverted.
   budget.
 - **Splats.** [Brush](https://github.com/ArthurBrussee/brush) trains on request (quick / full /
   uniform), with live previews while training; output is cleaned and built into a LoD as well.
-  GPS scenes train in ground blocks of up to ~500 frames, each on its own frames with steps
-  scaled to them, so quality per area doesn't drop as videos are added; each block is cropped
-  to its area and streamed as its own LoD.
+  GPS scenes train in ground blocks of ~500 frames, each with the full steps, so quality per
+  area doesn't drop as videos are added; each block is cropped to its area and streamed as
+  its own LoD.
 - **Viewer.** three.js + [Spark](https://github.com/sparkjsdev/spark): dense cloud, splats,
   sparse points by video, camera positions, and, for GPS scenes, an OpenStreetMap or
   satellite map laid under the scene on the fitted ground plane.

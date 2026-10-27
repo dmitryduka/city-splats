@@ -32,11 +32,11 @@ TRAIN_SETTINGS = {
     "uniform": (int(os.environ.get("TRAIN_UNIFORM_STEPS", 3000)), int(os.environ.get("TRAIN_UNIFORM_RES", 1024))),
 }
 UNIFORM_PIXELS = float(os.environ.get("UNIFORM_PIXELS", 2.0))
-# GPS scenes train splats in ground blocks (worker.pipeline.splat.blocks) of up to
-# TRAIN_BLOCK_FRAMES frames each, each with the steps above scaled to its own frames: one
-# global run spread the same steps over every video, and quality dropped as videos were added.
-# 500 frames at the full 7000 steps is ~14 steps per frame, as the first 469-frame Achapnyak
-# video had alone. 0 trains globally.
+# GPS scenes train splats in ground blocks (worker.pipeline.splat.blocks) of about
+# TRAIN_BLOCK_FRAMES frames (blocks under half of it are merged into neighbours), each with
+# the full steps above: one global run spread the same steps over every video, and quality
+# dropped as videos were added. 500 is about the first Achapnyak video alone (469 frames);
+# Achapnyak v5 (2805 frames) becomes 6 blocks. 0 trains globally.
 TRAIN_BLOCK_FRAMES = int(os.environ.get("TRAIN_BLOCK_FRAMES", 500))
 UNIFORM_INIT_POINTS = int(os.environ.get("UNIFORM_INIT_POINTS", 500_000))
 AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "none")

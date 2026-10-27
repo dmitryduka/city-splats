@@ -50,7 +50,7 @@ from worker.pipeline.ingest import probe
 from worker.pipeline.lod import build_lod
 from worker.pipeline.pieces import Piece, apply, compose, link_piece
 from worker.pipeline.splat import Snapshot, TrainingStopped
-from worker.pipeline.splat.blocks import Block, block_model, block_steps, crop_to_block, plan_blocks
+from worker.pipeline.splat.blocks import Block, block_model, crop_to_block, plan_blocks
 from worker.pipeline.splat.brush import eval_results
 from worker.pipeline.tiles import Spill, lod_files, sample_cloud, update_tiles
 from worker.pipeline.uniform import uniform_init
@@ -425,7 +425,7 @@ def _train_blocks(v: Version, quality: str, steps: int, max_resolution: int, rec
     whose frames and steps match the same block of an earlier version is reused."""
     geo = v.metrics["geo"]
     blocks = plan_blocks(rec, geo, TRAIN_BLOCK_FRAMES)
-    plan = [(block, block_steps(block, TRAIN_BLOCK_FRAMES, steps)) for block in blocks]
+    plan = [(block, steps) for block in blocks]
     total = sum(n for _, n in plan)
     earlier = _earlier_blocks(v, quality)
     # Held out: every 8th frame by name, as one global Brush run would hold out, so block and

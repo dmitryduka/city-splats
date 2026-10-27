@@ -4,7 +4,10 @@ over every frame, so each area got less optimisation with every video added.
 
 Blocks are leaves of a quadtree over the map frame (metres east/north from the scene's GPS
 origin, worker.pipeline.georef), on a fixed grid, split while more than `budget` frames look
-into a block (a frame looks where the median of its observed SfM points lies). The grid is
+into a block (a frame looks where the median of its observed SfM points lies); small leaves are
+merged into neighbours. Every block trains the full steps: held-out PSNR was still rising by
+0.6-1.3 dB per 500-750 steps when Achapnyak v5's blocks stopped at 1750-2450 steps scaled to
+their frames (Brush grows splats and decays the learning rate over the run's total steps). The grid is
 fixed and leaves split only where frames were added, so a block whose frames didn't change can
 be reused by the next version.
 
@@ -103,6 +106,24 @@ def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m
         key = f"g{level - 1}_{x // 2}_{y // 2}" if small else f"{level}_{x}_{y}"
         groups.setdefault(key, []).append(leaf)
 
+    # Every block trains the full steps (a short run stops growing splats and anneals early,
+    # whatever its frames), so a 40-frame block costs as much as a full one: blocks under half
+    # the budget join their nearest block while it stays under 1.5x the budget.
+    def size(key: str) -> int:
+        return sum(len(m[3]) for m in groups[key])
+
+    def gap(a: str, b: str) -> float:
+        return min(_rect_gap(cell(*m[:3]), cell(*n[:3])) for m in groups[a] for n in groups[b])
+
+    while True:
+        small = sorted((size(k), k) for k in groups if size(k) < budget // 2)
+        merges = [(gap(k, other), k, other) for n, k in small for other in groups
+                  if other != k and size(other) + n <= 1.5 * budget]
+        if not merges:
+            break
+        _, key, into = min(merges)
+        groups[into] += groups.pop(key)
+
     blocks = []
     for key, members in groups.items():
         idx = np.concatenate([m[3] for m in members])
@@ -115,12 +136,6 @@ def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m
         blocks.append(Block(key, cells, grow, sorted(names[idx].tolist()),
                             sorted(names[np.concatenate([idx, near])].tolist())))
     return blocks
-
-
-def block_steps(block: Block, budget: int, steps: int, min_fraction: float = 0.25) -> int:
-    """Steps for a block: the full count at `budget` frames of its own, proportionally fewer
-    below (down to min_fraction), so every block gets about the same steps per frame."""
-    return int(round(steps * min(1.0, max(min_fraction, len(block.core) / budget))))
 
 
 def block_model(rec: pycolmap.Reconstruction, geo: dict, block: Block) -> pycolmap.Reconstruction:
@@ -148,6 +163,10 @@ def crop_to_block(splat_ply: Path, out_ply: Path, geo: dict, block: Block, block
     mine = np.argmin(distance, axis=1) == next(i for i, b in enumerate(blocks) if b.key == block.key)
     write_ply(out_ply, header, rows[mine])
     return int(mine.sum())
+
+
+def _rect_gap(a: Rect, b: Rect) -> float:
+    return float(np.hypot(max(a[0] - b[2], b[0] - a[2], 0.0), max(a[1] - b[3], b[1] - a[3], 0.0)))
 
 
 def _rect_distance(xy: np.ndarray, rect: Rect) -> np.ndarray:
