@@ -42,6 +42,7 @@ def main() -> None:
             parent = session.get(Version, version.parent_id) if version.parent_id else None
             contribution = session.get(Contribution, version.contribution_id)
         work = SCENES_ROOT / slug / "contributions" / contribution.image_dir_name
+        work.mkdir(parents=True, exist_ok=True)
         names = sorted(_names(version.reconstruction_path) - (_names(parent.reconstruction_path) if parent else set()))
         rec = pycolmap.Reconstruction(DATA_ROOT / version.reconstruction_path)
         image_root = SCENES_ROOT / Path(version.reconstruction_path).parts[1] / "images"
