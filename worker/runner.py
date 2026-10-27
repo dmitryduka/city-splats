@@ -18,6 +18,7 @@ from backend.app.config import (
     AUTO_TRAIN,
     BUILD_LOD_BIN,
     DATA_ROOT,
+    DEPTH_MODEL,
     DENSE_STRIDE,
     DENSE_TILE_POINTS,
     LINK_CANDIDATE_STRIDE,
@@ -33,6 +34,7 @@ from backend.app.config import (
     UNIFORM_INIT_POINTS,
     UNIFORM_PIXELS,
     files_url,
+    scene_setting,
 )
 from backend.app.db import session_scope
 from backend.app.models import Contribution, Scene, Version, utcnow
@@ -234,7 +236,8 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
             depth_dir = depth_job.result()
             with prefetch.paused():
                 dense_rad = _densify(head, pycolmap.Reconstruction(piece.reconstruction), image_root, names,
-                                     work, metrics, progress, depth_dir, scene_from_piece=piece.scene_from_piece)
+                                     work, metrics, progress, depth_dir, scene_from_piece=piece.scene_from_piece,
+                                     settings=scene.settings)
             shutil.rmtree(depth_dir, ignore_errors=True)
         except Exception:  # noqa: BLE001 - the version is still useful without a dense cloud
             log.exception("densification failed for contribution %s; using the sparse points", c.id)
@@ -282,19 +285,20 @@ def _await(job: tuple, progress: Progress, stage: str):
 
 def _densify(head: Version | None, rec: pycolmap.Reconstruction, image_root: Path, names: list[str],
              work: Path, metrics: dict, progress: Progress, depth_dir: Path | None = None,
-             scene_from_piece: pycolmap.Sim3d | None = None) -> Path:
+             scene_from_piece: pycolmap.Sim3d | None = None, settings: dict | None = None) -> Path:
     """Dense cloud for this contribution, merged into the parent's tiles; returns the tile
     list the viewer loads. The scene keeps the first video's voxel size. Depth maps are
     predicted unless `depth_dir` already holds them. `rec` is the video's piece, placed by
-    scene_from_piece."""
+    scene_from_piece. `settings`: the scene's overrides (scene_setting)."""
+    stride = scene_setting(settings, "DENSE_STRIDE", DENSE_STRIDE)
     dense_dir = work / "dense"
     dense_dir.mkdir(exist_ok=True)
     if depth_dir is None:
         depth_dir = dense_dir / "depth"
-        predict_depth(image_root, names, depth_dir,
+        predict_depth(image_root, names, depth_dir, scene_setting(settings, "DEPTH_MODEL", DEPTH_MODEL),
                       on_progress=lambda done, total: progress.update(
                           0.6 * done / total, detail=f"Predicting depth {done}/{total}"))
-    frames, footprint = align_frames(rec, names, depth_dir, stride=DENSE_STRIDE)
+    frames, footprint = align_frames(rec, names, depth_dir, stride=stride)
     parent = head.metrics.get("dense_tiles") if head else None
     voxel = parent["voxel"] if parent else footprint * (scene_from_piece.scale if scene_from_piece else 1.0)
     spill = Spill(dense_dir / "spill", voxel)
@@ -302,11 +306,13 @@ def _densify(head: Version | None, rec: pycolmap.Reconstruction, image_root: Pat
     def sink(xyz: np.ndarray, rgb: np.ndarray) -> None:
         spill.add(apply(scene_from_piece, xyz).astype(np.float32) if scene_from_piece else xyz, rgb)
 
-    fused = fuse_frames(frames, image_root, sink, stride=DENSE_STRIDE,
+    fused = fuse_frames(frames, image_root, sink, stride=stride,
                         on_progress=lambda done, total: progress.update(
                             0.6 + 0.2 * done / total, detail=f"Fusing depth maps {done}/{total}"))
     shutil.rmtree(dense_dir / "depth", ignore_errors=True)
-    manifest = update_tiles(parent, spill, dense_dir / "tiles", DATA_ROOT, BUILD_LOD_BIN, DENSE_TILE_POINTS, LOD_JOBS,
+    manifest = update_tiles(parent, spill, dense_dir / "tiles", DATA_ROOT, BUILD_LOD_BIN,
+                            scene_setting(settings, "DENSE_TILE_POINTS", DENSE_TILE_POINTS),
+                            scene_setting(settings, "LOD_JOBS", LOD_JOBS),
                             on_progress=lambda done, total: progress.update(
                                 0.8 + 0.2 * done / total, detail=f"Building tile LoDs {done}/{total}"))
     shutil.rmtree(dense_dir / "spill", ignore_errors=True)
@@ -498,6 +504,7 @@ def train_version(version_id: int) -> None:
         scene = session.get(Scene, v.scene_id)
     quality = v.train_quality or "quick"
     steps, max_resolution = TRAIN_SETTINGS[quality]
+    max_resolution = scene_setting(scene.settings, f"TRAIN_{quality.upper()}_RES", max_resolution)
     # The frames live with the scene that made the reconstruction (a showcase scene such as
     # office-tsdf borrows another scene's reconstruction and has no images of its own).
     image_root = SCENES_ROOT / Path(v.reconstruction_path).parts[1] / "images"

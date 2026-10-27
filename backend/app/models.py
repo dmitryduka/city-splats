@@ -16,6 +16,8 @@ class Scene(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     head_version_id: int | None = None
+    # Overrides of backend.app.config settings for this scene, by name (scene_setting).
+    settings: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
 
 class Contribution(SQLModel, table=True):

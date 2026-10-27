@@ -22,6 +22,7 @@ def _sqlite_pragmas(dbapi_connection, _record) -> None:
 
 # Columns added after the first release; create_all() doesn't alter existing tables.
 _ADDED_COLUMNS = {
+    "scene": {"settings": "JSON"},
     "contribution": {"detail": "VARCHAR", "timeline": "JSON"},
     "version": {
         "splat_kind": "VARCHAR DEFAULT ''",

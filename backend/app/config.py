@@ -47,6 +47,9 @@ TRAIN_PREVIEW_EVERY = int(os.environ.get("TRAIN_PREVIEW_EVERY", 1000))
 # gave the 4-part office 61M points, and rebuilding the whole-scene LoD took 3 h (v3) and
 # 14 h (v4) on the M3 (whole-scene LoD, before tiles).
 DENSE_STRIDE = int(os.environ.get("DENSE_STRIDE", 2))
+# Monocular depth for the dense cloud (Hugging Face id). Small: 0.67 s/frame on the M3 (MPS);
+# Base (~4x the parameters, sharper and more accurate at edges): 1.26 s/frame.
+DEPTH_MODEL = os.environ.get("DEPTH_MODEL", "depth-anything/Depth-Anything-V2-Small-hf")
 # Dense tiles (worker.pipeline.tiles) split above DENSE_TILE_POINTS points. Achapnyak v5
 # (121M points): 104 tiles at 4M, 150 at 2M, built in 2.5-4.5 min (one 3.9M-point tile LoD:
 # 20 s, 1 GB) instead of one whole-scene LoD that was still running after an hour, swapping.
@@ -84,3 +87,10 @@ MIN_REGISTRATION_RATIO = float(os.environ.get("MIN_REGISTRATION_RATIO", 0.6))
 def files_url(path: Path) -> str:
     """Public URL for a file under DATA_ROOT (served by the backend at /files)."""
     return "/files/" + path.resolve().relative_to(DATA_ROOT.resolve()).as_posix()
+
+
+def scene_setting(scene_settings: dict | None, name: str, default):
+    """A setting above (`default`), unless the scene overrides it under the same name
+    (Scene.settings), so scenes can be processed differently side by side."""
+    value = (scene_settings or {}).get(name)
+    return default if value is None else type(default)(value)

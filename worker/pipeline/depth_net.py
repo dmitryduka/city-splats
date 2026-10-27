@@ -1,11 +1,11 @@
 """Monocular depth for densification, run as a subprocess (torch and pycolmap each bundle an
 OpenMP runtime and can't share a process).
 
-  python -m worker.pipeline.depth_net <image_root> <names_file> <out_dir> [device]
+  python -m worker.pipeline.depth_net <image_root> <names_file> <out_dir> <model> [device]
 
 Writes <out_dir>/<name>.npy: relative inverse depth (affine-invariant disparity, float16) at
 the network's output resolution; worker.pipeline.dense aligns it to the SfM points.
-Model: Depth Anything V2 Small (Apache-2.0).
+Model: Depth Anything V2 (Hugging Face id; Small and Base are Apache-2.0).
 """
 
 from __future__ import annotations
@@ -19,17 +19,14 @@ import torch
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
-MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
-
-
 def main() -> None:
-    image_root, names_file, out_dir = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
-    device = sys.argv[4] if len(sys.argv) > 4 else ("cuda" if torch.cuda.is_available() else
+    image_root, names_file, out_dir, model_id = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+    device = sys.argv[5] if len(sys.argv) > 5 else ("cuda" if torch.cuda.is_available() else
                                                       "mps" if torch.backends.mps.is_available() else "cpu")
     names = names_file.read_text().split("\n")
     names = [n for n in names if n]
-    processor = AutoImageProcessor.from_pretrained(MODEL)
-    model = AutoModelForDepthEstimation.from_pretrained(MODEL).to(device).eval()
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = AutoModelForDepthEstimation.from_pretrained(model_id).to(device).eval()
     started = time.time()
     for k, name in enumerate(names):
         image = Image.open(image_root / name).convert("RGB")

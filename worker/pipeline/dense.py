@@ -44,14 +44,14 @@ class DenseStats:
                 "voxel": round(self.voxel, 5), "fit_error_median": round(self.fit_error_median, 4)}
 
 
-def predict_depth(image_root: Path, names: list[str], out_dir: Path,
+def predict_depth(image_root: Path, names: list[str], out_dir: Path, model: str,
                   on_progress: Callable[[int, int], None] | None = None) -> None:
     """Run the depth network over the frames in a subprocess (see depth_net)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     names_file = out_dir / "names.txt"
     names_file.write_text("\n".join(names))
     proc = subprocess.Popen(
-        [sys.executable, "-m", "worker.pipeline.depth_net", str(image_root), str(names_file), str(out_dir)],
+        [sys.executable, "-m", "worker.pipeline.depth_net", str(image_root), str(names_file), str(out_dir), model],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     assert proc.stdout is not None

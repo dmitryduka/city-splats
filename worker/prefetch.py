@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 from sqlmodel import select
 
-from backend.app.config import SCENES_ROOT
+from backend.app.config import DEPTH_MODEL, SCENES_ROOT, scene_setting
 from backend.app.db import session_scope
 from backend.app.models import Contribution, Scene, Version
 from worker.pipeline.dense import predict_depth
@@ -431,7 +431,9 @@ class Prefetcher:
                 if not _pending(c.id):
                     raise RuntimeError(f"contribution {c.id} is no longer queued")
                 shutil.rmtree(out, ignore_errors=True)
-                predict_depth(SCENES_ROOT / slug / "images", names, out,
+                with session_scope() as session:
+                    settings = session.get(Scene, c.scene_id).settings
+                predict_depth(SCENES_ROOT / slug / "images", names, out, scene_setting(settings, "DEPTH_MODEL", DEPTH_MODEL),
                               on_progress=lambda done, total: relay(done / total, f"Predicting depth {done}/{total}"))
                 (out / DEPTH_MARKER).touch()
                 if not _pending(c.id):  # rejected meanwhile: nobody will fuse these
