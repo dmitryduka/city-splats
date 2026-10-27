@@ -22,9 +22,26 @@ from backend.app.models import Contribution, Scene, Version, utcnow
 from worker.runner import _densify
 
 
-class _ConsoleProgress:
+class _Progress:
+    """Printed, and shown in the UI under the version being rebuilt (its train_detail, shown
+    while it isn't training)."""
+
+    def __init__(self, version_id: int):
+        self.version_id, self.last = version_id, 0.0
+
     def update(self, fraction: float, detail: str | None = None) -> None:
         print(f"\r  {fraction:5.0%} {detail or ''}\033[K", end="", flush=True)
+        if time.time() - self.last > 3:
+            self.last = time.time()
+            _set_detail(self.version_id, f"Rebuilding dense cloud: {detail or ''} ({fraction:.0%})")
+
+
+def _set_detail(version_id: int, detail: str | None) -> None:
+    with session_scope() as session:
+        v = session.get(Version, version_id)
+        v.train_detail, v.updated_at = detail, utcnow()
+        session.add(v)
+        session.commit()
 
 
 def _names(path: str) -> set[str]:
@@ -38,6 +55,8 @@ def main() -> None:
         scene = session.exec(select(Scene).where(Scene.slug == slug)).one()
         versions = session.exec(select(Version).where(Version.scene_id == scene.id).order_by(Version.number)).all()
     for version in versions:
+        _set_detail(version.id, "Dense cloud waiting to be rebuilt")
+    for version in versions:
         with session_scope() as session:
             parent = session.get(Version, version.parent_id) if version.parent_id else None
             contribution = session.get(Contribution, version.contribution_id)
@@ -50,7 +69,7 @@ def main() -> None:
         metrics = dict(version.metrics)
         started = time.time()
         print(f"v{version.number} ({contribution.filename}, {len(names)} frames)")
-        tiles = _densify(parent, rec, image_root, names, work, metrics, _ConsoleProgress(), settings=scene.settings)
+        tiles = _densify(parent, rec, image_root, names, work, metrics, _Progress(version.id), settings=scene.settings)
         with session_scope() as session:
             for row in (session.get(Version, version.id), session.get(Contribution, version.contribution_id)):
                 row.metrics = {k: v for k, v in row.metrics.items() if k != "dense_failed"} | {
@@ -59,6 +78,7 @@ def main() -> None:
                 session.add(row)
             v = session.get(Version, version.id)
             v.dense_url = files_url(tiles)
+            v.train_detail = None
             session.commit()
         print(f"\n  {metrics['dense']} in {time.time() - started:.0f}s")
 
