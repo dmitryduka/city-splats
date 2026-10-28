@@ -29,7 +29,8 @@ be reverted.
   area doesn't drop as videos are added; each block is cropped to its area and streamed as
   its own LoD. Per-scene settings can train blocks on more than the SfM keyframes (extra
   frames between them, keyframes decoded again at full resolution, one camera per video) and
-  start them from the dense cloud.
+  start them from the dense cloud. Splats painting the sky (segmented in the frames) or floating
+  above the roofs are removed after each block trains.
 - **Viewer.** three.js + [Spark](https://github.com/sparkjsdev/spark): dense cloud, splats,
   sparse points by video, camera positions, and, for GPS scenes, an OpenStreetMap or
   satellite map laid under the scene on the fitted ground plane.

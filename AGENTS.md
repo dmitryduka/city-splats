@@ -13,6 +13,7 @@
   `depth_net`, `tiles` (the dense cloud as an octree of tiles, each with its own LoD), `lod`,
   `cleanup`, `georef`, `splat/brush.py`, `splat/blocks.py` (training in ground blocks),
   `splat/frames.py` (extra and full-resolution training frames, one camera per video),
+  `sky` + `sky_net` (removing sky splats after a block trains),
   `devices/dji.py` (telemetry).
   `register.py` is the older merge path and is no longer called.
 - `frontend/src/App.tsx` holds the view state and keyboard shortcuts;

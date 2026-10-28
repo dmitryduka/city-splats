@@ -37,6 +37,7 @@ from backend.app.config import (
     TRAIN_FRAME_SIDE,
     TRAIN_PREVIEW_EVERY,
     TRAIN_SHARED_CAMERAS,
+    TRAIN_SKY_EVERY,
     TRAIN_SETTINGS,
     UNIFORM_INIT_POINTS,
     UNIFORM_PIXELS,
@@ -55,6 +56,7 @@ from worker.pipeline.georef import georeference
 from worker.pipeline.features import DEFAULT_FEATURES, feature_config
 from worker.pipeline.ingest import probe
 from worker.pipeline.lod import build_lod
+from worker.pipeline.sky import remove_sky
 from worker.pipeline.pieces import Piece, apply, compose, link_piece
 from worker.pipeline.splat import Snapshot, TrainingStopped
 from worker.pipeline.splat.blocks import Block, block_init, block_model, block_plan, crop_to_block, plan_blocks
@@ -475,6 +477,7 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
             cloud = sample_cloud(manifest, DATA_ROOT, 4 * dense_init * len(blocks), on_progress=progress.counts)
         progress.finish()
 
+    sky_every = scene_setting(scene.settings, "TRAIN_SKY_EVERY", TRAIN_SKY_EVERY)
     progress.set_estimate("train", timing.estimate(f"train.{quality}", total))
     progress.start("train")
     done, rads, results = 0, [], {}
@@ -520,6 +523,10 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
         shutil.rmtree(block_dir / "train" / "exports", ignore_errors=True)
         stats = clean_splats(block_dir / "cropped.ply", block_model(rec, geo, block), block_dir / "splat.ply")
         (block_dir / "cropped.ply").unlink()
+        sky = None
+        if sky_every:
+            progress.update((done + n) / total, detail=f"Block {i}/{len(plan)} · removing the sky")
+            sky = remove_sky(block_dir, model, geo, train_root, SCENES_ROOT / scene.slug / "sky_masks", sky_every)
         rads.append(build_lod(BUILD_LOD_BIN, block_dir / "splat.ply", block_dir / "lod", quality=True))
         done += n
         evals = eval_results(block_dir / "train")
@@ -527,9 +534,9 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
             "dir": rel(block_dir), "cells": block.cells, "grow": block.grow, "frames": len(block.core),
             "train_frames": len(set(block.images) & registered) - len(eval_names), "eval_frames": len(eval_names),
             "steps": n, "images_hash": block.images_hash, "eval": evals[-1] if evals else None, "kept": kept,
-            "cleanup": stats.as_dict(), **({"init": init} if init else {}),
+            "cleanup": stats.as_dict(), **({"init": init} if init else {}), **({"sky": sky} if sky else {}),
         }
-        report["blocks"][block.key] = {k: results[block.key][k] for k in ("frames", "train_frames", "eval", "kept")}
+        report["blocks"][block.key] = {k: results[block.key].get(k) for k in ("frames", "train_frames", "eval", "kept", "sky")}
         _report(v.id, report)
         log.info("version %s block %s (%d/%d): %s", v.id, block.key, i, len(plan), results[block.key]["eval"])
     timing.record(f"train.{quality}", total, progress.finish())

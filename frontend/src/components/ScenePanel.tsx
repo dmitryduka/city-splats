@@ -229,7 +229,8 @@ const TRAIN_OPTIONS: { quality: TrainQuality; label: string; title: string }[] =
   { quality: "full", label: "Full quality", title: "7000 steps at 1600 px; best quality, ~4x longer" },
 ];
 
-type BlockReport = { frames: number; train_frames: number; eval?: { psnr: number } | null; kept?: number };
+type SkyReport = { total: number; sky: number; above_roofs: number };
+type BlockReport = { frames: number; train_frames: number; eval?: { psnr: number } | null; kept?: number; sky?: SkyReport | null };
 type FramesReport = {
   keyframes: number;
   full_resolution: number;
@@ -243,9 +244,13 @@ type TrainReport = { frames?: FramesReport | null; blocks?: Record<string, Block
 
 /** What block training found: frames prepared (worker.pipeline.splat.frames) and each
  * finished block's held-out PSNR; live while training, then from the splat metrics. */
-function TrainingReport({ report }: { report: TrainReport }) {
+function TrainingReport({ report, skyRemoved }: { report: TrainReport; skyRemoved?: Record<string, SkyReport> }) {
   const f = report.frames;
   const blocks = Object.entries(report.blocks ?? {});
+  // Sky removal (worker.pipeline.sky): by the worker per block, or by scripts.remove_sky.
+  const sky = blocks
+    .map(([key, b]) => [key, b.sky ?? skyRemoved?.[key]] as const)
+    .filter((e): e is readonly [string, SkyReport] => e[1] != null);
   const psnrs = blocks.map(([, b]) => b.eval?.psnr).filter((p): p is number => p != null);
   const mean = psnrs.length ? psnrs.reduce((a, b) => a + b, 0) / psnrs.length : null;
   return (
@@ -268,6 +273,14 @@ function TrainingReport({ report }: { report: TrainReport }) {
           Held-out PSNR{mean != null && ` (mean ${mean.toFixed(2)} dB)`}:{" "}
           {blocks
             .map(([key, b]) => `${key} ${b.eval ? b.eval.psnr.toFixed(2) : "–"} (${b.train_frames} fr${b.kept ? `, ${(b.kept / 1e6).toFixed(1)}M splats` : ""})`)
+            .join(" · ")}
+        </div>
+      )}
+      {sky.length > 0 && (
+        <div title="Splats on sky in most views that see them, or more than 10 m above the roofs; held-out PSNR above is from before">
+          Sky removed:{" "}
+          {sky
+            .map(([key, s]) => `${key} ${(((s.sky + s.above_roofs) / s.total) * 100).toFixed(1)}% (${s.sky} on sky, ${s.above_roofs} above roofs)`)
             .join(" · ")}
         </div>
       )}
@@ -347,7 +360,10 @@ function VersionRow({
               </div>
               {v.train_detail && <div className="muted small">{v.train_detail}</div>}
               {v.train_timeline && v.train_timeline.length > 0 && <Timeline timeline={v.train_timeline} />}
-              {v.metrics.training_report != null && <TrainingReport report={v.metrics.training_report as TrainReport} />}
+              {v.metrics.training_report != null && (
+                <TrainingReport report={v.metrics.training_report as TrainReport}
+                  skyRemoved={v.metrics.sky_removed as Record<string, SkyReport> | undefined} />
+              )}
             </>
           )}
           <button className="small" onClick={() => api.cancelTraining(slug, v.id).catch((e) => onError(e.message))}>
@@ -370,7 +386,8 @@ function VersionRow({
         </div>
       )}
       {!busy && (v.metrics.splat_full as TrainReport | undefined)?.blocks && (
-        <TrainingReport report={v.metrics.splat_full as TrainReport} />
+        <TrainingReport report={v.metrics.splat_full as TrainReport}
+          skyRemoved={v.metrics.sky_removed as Record<string, SkyReport> | undefined} />
       )}
     </li>
   );

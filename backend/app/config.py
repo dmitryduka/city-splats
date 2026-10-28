@@ -53,6 +53,11 @@ TRAIN_SHARED_CAMERAS = int(os.environ.get("TRAIN_SHARED_CAMERAS", 0))
 TRAIN_FRAME_SIDE = int(os.environ.get("TRAIN_FRAME_SIDE", 0))
 TRAIN_EXTRA_FRAMES = int(os.environ.get("TRAIN_EXTRA_FRAMES", 0))
 TRAIN_DENSE_INIT = int(os.environ.get("TRAIN_DENSE_INIT", 0))
+# Sky removal after each block trains (worker.pipeline.sky): splats on sky (SegFormer masks) in
+# most of every TRAIN_SKY_EVERY-th view of the block, or above the roofs, are dropped; the sky
+# then renders empty. Every 4th view of Achapnyak Ultra's first block (447 of 1786) still saw
+# each splat 68 times (median); masks took 1.6 s/frame on the M3's CPU. 0 keeps the sky.
+TRAIN_SKY_EVERY = int(os.environ.get("TRAIN_SKY_EVERY", 4))
 UNIFORM_INIT_POINTS = int(os.environ.get("UNIFORM_INIT_POINTS", 500_000))
 AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "none")
 TRAIN_PREVIEW_EVERY = int(os.environ.get("TRAIN_PREVIEW_EVERY", 1000))
