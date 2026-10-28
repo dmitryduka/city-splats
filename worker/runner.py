@@ -420,6 +420,8 @@ def _train_global(v: Version, quality: str, steps: int, max_resolution: int, rec
         image_root, reconstruction, work / "train", steps, max_resolution, init_ply, TRAIN_PREVIEW_EVERY,
         on_snapshot, should_stop=lambda: _training_should_stop(v.id),
         sh_degree=0 if uniform else 3, freeze_scales=uniform is not None,
+        on_step=lambda step, splats: progress.update(
+            step / steps, detail=f"Step {step}/{steps} · {splats / 1e6:.1f}M splats"),
     )
     timing.record(f"train.{quality}", steps, progress.finish())
 
@@ -516,6 +518,8 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
         raw = compute.trainer().train(
             train_root, block_dir / "model", block_dir / "train", n, max_resolution, init_ply, TRAIN_PREVIEW_EVERY,
             on_snapshot, should_stop=lambda: _training_should_stop(v.id), eval_names=eval_names,
+            on_step=lambda step, splats, i=i: progress.update(
+                (done + step) / total, detail=f"Block {i}/{len(plan)} · step {step}/{n} · {splats / 1e6:.1f}M splats"),
         )
         if init_ply is not None:
             init_ply.unlink()

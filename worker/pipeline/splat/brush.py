@@ -1,4 +1,5 @@
-"""Brush trainer (headless CLI). Progress is observed through its periodic PLY exports."""
+"""Brush trainer (headless CLI). Progress is observed through its periodic PLY exports, and
+between them through the step and splat count it logs every 200 steps (at each refine)."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from . import Snapshot, TrainingStopped
 
 _EXPORT_RE = re.compile(r"splat_(\d+)\.ply$")
 _EVAL_RE = re.compile(r"Eval iter (\d+): PSNR ([\d.]+), ssim ([\d.]+)")
+_REFINE_RE = re.compile(r"Refine iter (\d+), (\d+) splats")
 
 
 def eval_results(work_dir: Path) -> list[dict]:
@@ -52,6 +54,7 @@ class BrushTrainer:
         sh_degree: int = 3,
         freeze_scales: bool = False,
         eval_names: list[str] | None = None,
+        on_step: Callable[[int, int], None] | None = None,
     ) -> Path:
         """Trains and returns the final export. Frames in `eval_names` are held out and
         evaluated on (eval_results); otherwise every 8th frame by name."""
@@ -96,6 +99,21 @@ class BrushTrainer:
         proc = subprocess.Popen(cmd, cwd=cache_dir, stdout=log, stderr=subprocess.STDOUT, env=env)
 
         seen: set[int] = set()
+        log_pos, last_step = 0, 0
+
+        def poll_log() -> None:
+            nonlocal log_pos, last_step
+            with open(work_dir / "brush.log", errors="replace") as f:
+                f.seek(log_pos)
+                text = f.read()
+            # Keep a partly written last line for the next poll.
+            text = text[:text.rfind("\n") + 1]
+            log_pos += len(text.encode())
+            for match in _REFINE_RE.finditer(text):
+                step, splats = int(match[1]), int(match[2])
+                if step > last_step:
+                    last_step = step
+                    on_step(step, splats)
 
         def poll_exports() -> None:
             for path in sorted(export_dir.glob("splat_*.ply")):
@@ -118,6 +136,8 @@ class BrushTrainer:
                 log.close()
                 raise TrainingStopped()
             poll_exports()
+            if on_step:
+                poll_log()
             time.sleep(2)
         log.close()
         poll_exports()
