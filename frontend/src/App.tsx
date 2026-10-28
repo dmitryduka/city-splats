@@ -4,6 +4,7 @@ import { SceneList } from "./components/SceneList";
 import { ScenePanel } from "./components/ScenePanel";
 import { SplatViewer, type ViewMode } from "./viewer/SplatViewer";
 import type { Geo, MapStyle } from "./viewer/mapTiles";
+import { BLOCK_COLORS, blockOverlays, type BlockOverlay } from "./viewer/blockOverlay";
 
 const MODE_KEYS: Record<string, ViewMode> = { "1": "dense", "2": "splats", "3": "points_source", "4": "points_rgb" };
 const MODE_LABELS: Record<ViewMode, string> = {
@@ -64,6 +65,7 @@ export default function App() {
   const [kindChoice, setKindChoice] = useState<SplatKind | null>(null);
   const kindsRef = useRef<{ kinds: SplatKind[]; kind: SplatKind | null }>({ kinds: [], kind: null });
   const [showCameras, setShowCameras] = useState(false);
+  const [showBlocks, setShowBlocks] = useState(true);
   const [mapStyle, setMapStyle] = useState<MapStyle | null>(null);
   // Cloud/splat opacity, offered while a map is shown so it can show through. Applied cubed:
   // many splats overlap along each ray, so per-splat opacity must drop fast to see through.
@@ -147,6 +149,10 @@ export default function App() {
       if (MODE_KEYS[e.key]) show(MODE_KEYS[e.key]);
       if (e.key === "v" || e.key === "V") show(modeRef.current === "splats" ? "dense" : "splats");
       if (e.key === "c" || e.key === "C") setShowCameras((v) => !v);
+      if (e.key === "b" || e.key === "B") {
+        if (!geoRef.current) toast("No blocks to show: none of this version's videos has GPS", "error");
+        else setShowBlocks((v) => !v);
+      }
       if (e.key === "m" || e.key === "M") {
         if (!geoRef.current) toast("No map: none of this version's videos has GPS", "error");
         else setMapStyle((s) => MAP_CYCLE[(MAP_CYCLE.indexOf(s) + 1) % MAP_CYCLE.length]);
@@ -183,6 +189,9 @@ export default function App() {
   const geo = useMemo(() => JSON.parse(geoJson) as Geo | null, [geoJson]);
   geoRef.current = geo;
   useEffect(() => setMapSource(null), [mapStyle, geo]);
+  const training = selected?.train_status === "training" || selected?.train_status === "cancelling";
+  const blocksJson = JSON.stringify(selected && geo ? blockOverlays(selected.metrics, training, kind) : []);
+  const blocks = useMemo(() => JSON.parse(blocksJson) as BlockOverlay[], [blocksJson]);
   const sizable = surface === "dense" || (!live && kind === "uniform");
   const seqs = new Set(
     (selected?.contribution_ids ?? [])
@@ -217,6 +226,7 @@ export default function App() {
           geo={geo}
           mapStyle={mapStyle}
           onMapSource={(attribution, failed) => setMapSource({ attribution, failed })}
+          blocks={showBlocks ? blocks : null}
         />}
         {state && !splatUrl && !selected && (
           <div className="empty">Upload a video to start reconstructing “{state.scene.name}”.</div>
@@ -312,6 +322,17 @@ export default function App() {
               {mapSource && (mapSource.failed ? " · some map tiles failed to load" : ` · ${mapSource.attribution}`)}
             </div>
           )}
+          {showBlocks && blocks.length > 0 && (
+            <div className="legend">
+              training blocks:
+              {(["done", "training", "queued"] as const).map((s) => (
+                <span key={s}>
+                  <i style={{ background: BLOCK_COLORS[s], borderRadius: 1 }} />
+                  {s === "done" ? "trained" : s} {blocks.filter((b) => b.status === s).length}
+                </span>
+              ))}
+            </div>
+          )}
           {mode === "points_source" && (
             <div className="legend">
               {[...seqs].map((s) => (
@@ -325,7 +346,7 @@ export default function App() {
               </span>
             </div>
           )}
-          <div className="muted">WASD / drag · V cloud ⇄ splats · 1 cloud · 2 splats · 3 by video · 4 sparse · K splat kind · C cameras · M map · [ ] splat size</div>
+          <div className="muted">WASD / drag · V cloud ⇄ splats · 1 cloud · 2 splats · 3 by video · 4 sparse · K splat kind · C cameras · M map · B blocks · [ ] splat size</div>
           <label className="follow">
             <input type="checkbox" checked={followLive} onChange={(e) => setFollowLive(e.target.checked)} /> follow
             live training

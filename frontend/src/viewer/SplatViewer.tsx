@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { PLYLoader } from "three/examples/jsm/loaders/PLYLoader.js";
 import { dyno, SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import { buildMap, type Geo, type MapStyle } from "./mapTiles";
+import { buildBlocks, type BlockOverlay } from "./blockOverlay";
 
 /** "dense" and "splats" both show the streamed meshes at splatUrl (a dense cloud is streamed
  * as small splats); the points modes show the sparse PLY layers instead. */
@@ -32,6 +33,8 @@ type Props = {
   mapStyle?: MapStyle | null;
   /** The map's attribution once tiles load; failed when no provider served a tile. */
   onMapSource?: (attribution: string, failed: boolean) => void;
+  /** Splat training blocks drawn on the map plane (needs geo; null: hidden). */
+  blocks?: BlockOverlay[] | null;
 };
 
 type PointLayer = "points_source" | "points_rgb" | "cameras";
@@ -99,6 +102,7 @@ export function SplatViewer({
   geo = null,
   mapStyle = null,
   onMapSource,
+  blocks = null,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const ctxRef = useRef<Context | null>(null);
@@ -267,6 +271,19 @@ export function SplatViewer({
       ctx.dirty = true;
     };
   }, [geo, mapStyle, pixelRatio, lodSplatScale]);
+
+  // Training blocks on the map plane.
+  useEffect(() => {
+    const ctx = ctxRef.current;
+    if (!ctx || !geo || !blocks?.length) return;
+    const layer = buildBlocks(geo, blocks);
+    ctx.world.add(layer.group);
+    ctx.dirty = true;
+    return () => {
+      layer.dispose();
+      ctx.dirty = true;
+    };
+  }, [geo, blocks, pixelRatio, lodSplatScale]);
 
   useEffect(() => {
     const ctx = ctxRef.current;

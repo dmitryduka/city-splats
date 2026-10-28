@@ -88,7 +88,7 @@ scripts/dev.sh
 starts the backend (http://localhost:8000), the worker and the frontend
 (http://localhost:5173); logs go to `data/logs/`. Create a scene, drop videos onto it, and
 watch them process. Viewer keys: WASD/drag to move (Q/E down/up, Shift faster), `V` cloud ⇄
-splats, `1`–`4` view modes, `C` cameras, `K` splat kind, `M` map (street → satellite → off),
+splats, `1`–`4` view modes, `C` cameras, `K` splat kind, `M` map (street → satellite → off), `B` splat training blocks,
 `[` `]` splat size.
 
 ## Status

@@ -138,6 +138,13 @@ def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m
     return blocks
 
 
+def block_plan(blocks: list[Block]) -> list[dict]:
+    """Blocks as stored in Version.metrics["block_plan"]: cells in the map frame (metres
+    east/north, the frame of geo["scene_from_map"]), in training order."""
+    return [{"key": b.key, "cells": [[round(c, 2) for c in cell] for cell in b.cells], "grow": round(b.grow, 1),
+             "frames": len(b.core)} for b in blocks]
+
+
 def block_model(rec: pycolmap.Reconstruction, geo: dict, block: Block) -> pycolmap.Reconstruction:
     """The block's part of a model: its training frames, and the SfM points within its
     margin (the initialisation, and what floaters are carved against)."""

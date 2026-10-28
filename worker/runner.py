@@ -57,7 +57,7 @@ from worker.pipeline.ingest import probe
 from worker.pipeline.lod import build_lod
 from worker.pipeline.pieces import Piece, apply, compose, link_piece
 from worker.pipeline.splat import Snapshot, TrainingStopped
-from worker.pipeline.splat.blocks import Block, block_init, block_model, crop_to_block, plan_blocks
+from worker.pipeline.splat.blocks import Block, block_init, block_model, block_plan, crop_to_block, plan_blocks
 from worker.pipeline.splat.frames import (
     FrameStats,
     Video,
@@ -444,6 +444,7 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
     from the dense cloud."""
     geo = v.metrics["geo"]
     blocks = plan_blocks(rec, geo, TRAIN_BLOCK_FRAMES)
+    _save_block_plan(v.id, blocks)
     plan = [(block, steps) for block in blocks]
     total = sum(n for _, n in plan)
     earlier = _earlier_blocks(v, quality)
@@ -535,6 +536,16 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
     return _write_lod_list(rads, work / "tiles.json"), {
         "block_frames": TRAIN_BLOCK_FRAMES, "steps_total": total, "blocks": results,
         **({"frames": frames.as_dict()} if frames else {}), **({"dense_init": dense_init} if cloud is not None else {})}
+
+
+def _save_block_plan(version_id: int, blocks: list[Block]) -> None:
+    """Each block's ground cells in training order, for the viewer's block overlay (kept after
+    training, unlike the report)."""
+    with session_scope() as session:
+        v = session.get(Version, version_id)
+        v.metrics = v.metrics | {"block_plan": block_plan(blocks)}
+        session.add(v)
+        session.commit()
 
 
 def _report(version_id: int, report: dict) -> None:
