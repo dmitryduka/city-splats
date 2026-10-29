@@ -129,7 +129,7 @@ function Upload({ slug, onError }: { slug: string; onError: (m: string) => void 
       <input
         ref={inputRef}
         type="file"
-        accept="video/*"
+        accept="video/*,.insv"
         multiple
         hidden
         onChange={(e) => {

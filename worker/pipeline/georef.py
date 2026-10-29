@@ -69,6 +69,55 @@ def georeference(rec: pycolmap.Reconstruction, gps_files: Iterable[Path], min_fr
         error = np.linalg.norm(scale * scene @ rotation.T + translation - enu, axis=1)
         keep = error <= max(3 * np.median(error[keep]), 1.0)
 
+    return _geo(rec, scale, rotation, translation, origin, float(np.median(error[keep])), int(keep.sum()),
+                scene, sink_m)
+
+
+def georeference_anchors(rec: pycolmap.Reconstruction, anchors: dict[str, dict], sink_m: float = 0.5) -> dict | None:
+    """georeference() from a few known positions instead of a GPS track: anchors maps a
+    video prefix (c<id>) to {"start": [lat, lon]} and/or {"end": [lat, lon]}, pinning its
+    first or last registered moment. Two anchors fix position, scale and heading on the
+    ground; up is the cameras' mean up direction (a rider or walker holds the camera
+    upright, so tilts average out), heights are relative to the first anchor's camera."""
+    by_prefix: dict[str, list[pycolmap.Image]] = {}
+    for image in rec.images.values():
+        if image.has_pose:
+            by_prefix.setdefault(image.name.split("/")[0], []).append(image)
+    points: list[tuple[np.ndarray, tuple[float, float]]] = []
+    for prefix, ends in anchors.items():
+        images = sorted(by_prefix.get(prefix, []), key=lambda im: (im.name.split("/")[-1], im.name))
+        for end, latlon in ends.items():
+            if images:
+                image = images[0] if end == "start" else images[-1]
+                points.append((image.projection_center(), (float(latlon[0]), float(latlon[1]))))
+    if len(points) < 2:
+        return None
+    origin = points[0][1]
+    # A camera's up is -y; a rig's views tilted upwards (folders "*_up") don't count.
+    ups = np.array([-image.cam_from_world().rotation.matrix()[1] for image in rec.images.values()
+                    if image.has_pose and not image.name.rsplit("/", 2)[-2:][0].endswith("_up")])
+    up = ups.mean(0)
+    up /= np.linalg.norm(up)
+    # Scene axes: x, y horizontal, z up.
+    x = np.cross(up, [0.0, 0.0, 1.0] if abs(up[2]) < 0.9 else [1.0, 0.0, 0.0])
+    x /= np.linalg.norm(x)
+    level = np.stack([x, np.cross(up, x), up])
+    a, b = (level @ points[0][0]), (level @ points[-1][0])
+    east, north = geo_offset(points[-1][1], origin)
+    if np.hypot(*(b - a)[:2]) < 1e-6 or np.hypot(east, north) < 1.0:
+        return None
+    scale = np.hypot(east, north) / np.hypot(*(b - a)[:2])
+    theta = np.arctan2(north, east) - np.arctan2(*(b - a)[1::-1])
+    turn = np.array([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]])
+    rotation = turn @ level
+    translation = -scale * rotation @ points[0][0]
+    centres = np.array([image.projection_center() for image in rec.images.values() if image.has_pose])
+    return _geo(rec, scale, rotation, translation, origin, 0.0, len(points), centres, sink_m)
+
+
+def _geo(rec: pycolmap.Reconstruction, scale: float, rotation: np.ndarray, translation: np.ndarray,
+         origin: tuple[float, float], error_m: float, frames: int, scene: np.ndarray, sink_m: float) -> dict:
+    """The georeference record of enu = scale * rotation @ scene + translation."""
     heights = np.array([p.xyz for p in rec.points3D.values()]) @ (scale * rotation).T + translation
     ground = _ground_plane(heights) - [0, 0, sink_m]
 
@@ -85,7 +134,34 @@ def georeference(rec: pycolmap.Reconstruction, gps_files: Iterable[Path], min_fr
         "scene_from_enu": scene_from_enu.round(9).tolist(),
         "scene_from_map": (scene_from_enu @ enu_from_map).round(9).tolist(),
         "ground": [round(float(v), 5) for v in ground],
-        "error_m": round(float(np.median(error[keep])), 2),
-        "frames": int(keep.sum()),
+        "error_m": round(error_m, 2),
+        "frames": frames,
         "extent": [round(float(v), 1) for v in (*placed[:, :2].min(0), *placed[:, :2].max(0))],
     }
+
+
+CAMERA_HEIGHT_M = 1.5  # a rider's or walker's camera above the ground
+
+
+def anchor_offsets(anchors: dict, geo: dict) -> list[np.ndarray]:
+    """Where a video's anchors ({"start"/"end": [lat, lon]}) lie in a scene's ENU (metres)."""
+    return [geo_offset((float(ll[0]), float(ll[1])), tuple(geo["origin"])) for ll in anchors.values()]
+
+
+def scene_from_anchors(rec: pycolmap.Reconstruction, prefix: str, anchors: dict, geo: dict) -> pycolmap.Sim3d | None:
+    """Place a video's own model (prefix c<id>) in a georeferenced scene by its start/end
+    anchors alone, for a video that shares no view with the scene (a ride across town):
+    georeference_anchors fixes it in ENU around its start, the scene's geo maps ENU into the
+    scene; the start camera goes CAMERA_HEIGHT_M above the scene's ground plane, extended to
+    there (a guess on hilly ground, metres off a few km out)."""
+    own = georeference_anchors(rec, {prefix: anchors})
+    if own is None or "start" not in anchors:
+        return None
+    enu_from_piece = np.linalg.inv(np.array(own["scene_from_enu"]))
+    east, north = geo_offset(tuple(own["origin"]), tuple(geo["origin"]))
+    a, b, c = geo["ground"]
+    height = a * east + b * north + c + 0.5 + CAMERA_HEIGHT_M  # geo's ground sinks 0.5 m
+    shift = np.eye(4)
+    shift[:3, 3] = [east, north, height]
+    scene_from_piece = np.array(geo["scene_from_enu"]) @ shift @ enu_from_piece
+    return pycolmap.Sim3d(scene_from_piece[:3])

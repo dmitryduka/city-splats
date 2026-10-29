@@ -80,13 +80,14 @@ def _pose(points2D: np.ndarray, points3D: np.ndarray, camera: pycolmap.Camera) -
     return pycolmap.estimate_and_refine_absolute_pose(points2D, points3D, camera, options)
 
 
-def shared_cameras(rec: pycolmap.Reconstruction, stats: FrameStats) -> dict[str, int]:
+def shared_cameras(rec: pycolmap.Reconstruction, stats: FrameStats, skip: set[str] = frozenset()) -> dict[str, int]:
     """Put the frames of a video's implausible cameras on its most used plausible one,
     re-posing them from their 2D-3D matches; frames that don't fit are deregistered. Returns
-    the reference camera per video prefix (extra frames use it)."""
+    the reference camera per video prefix (extra frames use it). Videos in `skip` (rigs of
+    virtual views, whose cameras are exact) are left alone."""
     by_video: dict[str, Counter] = defaultdict(Counter)
     for image in rec.images.values():
-        if image.has_pose:
+        if image.has_pose and image.name.split("/")[0] not in skip:
             by_video[image.name.split("/")[0]][image.camera_id] += 1
     chosen = {}
     for prefix, counts in by_video.items():

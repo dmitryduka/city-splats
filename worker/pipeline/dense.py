@@ -144,7 +144,7 @@ def align_frames(rec: pycolmap.Reconstruction, names: list[str], depth_dir: Path
 def fuse_frames(frames: dict[int, _Frame], image_root: Path, sink: Callable[[np.ndarray, np.ndarray], None],
                 stride: int = 2, neighbours: tuple[int, ...] = (-4, -2, -1, 1, 2, 4), min_agree: int = 2,
                 tolerance: float = 0.06, workers: int = 6,
-                on_progress: Callable[[int, int], None] | None = None) -> int:
+                on_progress: Callable[[int, int], None] | None = None, mask_root: Path | None = None) -> int:
     """Unproject each frame's depth and pass the points its neighbours agree on to `sink`
     (xyz float32, rgb uint8), in frame order; returns how many. Nothing accumulates here, so
     memory doesn't grow with the length of the video.
@@ -152,7 +152,9 @@ def fuse_frames(frames: dict[int, _Frame], image_root: Path, sink: Callable[[np.
     Tolerances match the network's accuracy: per-frame fits to SfM depths are off by 4-7%
     (median) on the office, so a 3% agreement test with neighbours 3-6 frames away threw away
     most correct pixels. Office part 2 (78 frames): 0.8M points with (±3, ±6, 3%), 4.0M with
-    (±1, ±2, ±4, 6%), visibly filling walls, ceiling and floor without adding noise."""
+    (±1, ±2, ±4, 6%), visibly filling walls, ceiling and floor without adding noise.
+
+    With mask_root, pixels masked in <mask_root>/<name>.png (0, e.g. traffic) are left out."""
 
     def fuse(k: int, frame: _Frame) -> tuple[np.ndarray, np.ndarray] | None:
         depth = frame.depth
@@ -162,6 +164,10 @@ def fuse_frames(frames: dict[int, _Frame], image_root: Path, sink: Callable[[np.
         u, v = u.ravel(), v.ravel()
         z = depth[v, u]
         valid = np.isfinite(z)
+        mask_path = mask_root / f"{frame.image.name}.png" if mask_root is not None else None
+        if mask_path is not None and mask_path.exists():
+            mask = np.asarray(Image.open(mask_path).convert("L").resize((w, h), Image.NEAREST))
+            valid &= mask[v, u] > 127
         u, v, z = u[valid], v[valid], z[valid]
         rays = frame.camera.cam_from_img(np.stack([(u + 0.5) * sx, (v + 0.5) * sy], axis=1))
         cam_pts = np.concatenate([rays * z[:, None], z[:, None]], axis=1)

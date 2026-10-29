@@ -20,7 +20,9 @@ from pathlib import Path
 
 import numpy as np
 
+from worker.pipeline.devices.insta360 import read_rig
 from worker.pipeline.features import feature_config
+from worker.pipeline.masks import MASKS_DIR
 from worker.pipeline.sfm import reconstruct_initial
 from worker.reporting import FractionReporter
 
@@ -46,10 +48,16 @@ def main() -> None:
     names = [n for n in names_file.read_text().split("\n") if n]
     gps = json.loads(Path(sys.argv[6]).read_text()) if len(sys.argv) > 6 and sys.argv[6] != "-" else None
     reporter = FractionReporter(lambda fraction, detail: _emit({"fraction": round(fraction, 4), "detail": detail}))
+    # A rig video (devices.insta360) and its masks (worker.pipeline.masks) are found next to
+    # its images: <scene>/images/<prefix>/rig.json, <scene>/masks/<prefix>/.
+    prefix = names[0].split("/")[0]
+    rig = read_rig(image_root / prefix)
+    masks = image_root.parent / MASKS_DIR
     result = reconstruct_initial(
         image_root, names, out_dir, features, report=reporter, num_threads=threads,
         positions={name: np.array(xyz) for name, xyz in gps["positions"].items()} if gps else None,
         position_sigma=tuple(gps["sigma"]) if gps else (3.0, 3.0, 0.3),
+        rig=rig, mask_root=masks if (masks / prefix).is_dir() else None,
     )
     _emit({"result": result.__dict__})
 

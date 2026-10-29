@@ -33,14 +33,15 @@ from worker.pipeline.cleanup import clean_sparse, read_ply, write_ply
 
 
 def predict_sky(image_root: Path, names: list[str], out_dir: Path, device: str | None = None,
-                on_progress: Callable[[int, int], None] | None = None) -> None:
-    """Sky masks for the frames, in a subprocess (see sky_net); cached in out_dir."""
+                on_progress: Callable[[int, int], None] | None = None, movable_dir: Path | None = None) -> None:
+    """Sky masks for the frames, in a subprocess (see sky_net); cached in out_dir. With
+    movable_dir, also masks of vehicles and people there."""
     out_dir.mkdir(parents=True, exist_ok=True)
     names_file = out_dir / f"names_{abs(hash(tuple(names)))}.txt"
     names_file.write_text("\n".join(names))
     proc = subprocess.Popen(
         [sys.executable, "-m", "worker.pipeline.sky_net", str(image_root), str(names_file), str(out_dir),
-         *([device] if device else [])],
+         *([device] if device else []), *(["--movable", str(movable_dir)] if movable_dir else [])],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     assert proc.stdout is not None

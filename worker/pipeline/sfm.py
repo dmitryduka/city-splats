@@ -182,15 +182,19 @@ def _merge_by_track(reconstructions: dict[int, pycolmap.Reconstruction], sparse_
 
 
 def _map(database: Path, image_root: Path, sparse_dir: Path, names: list[str], incremental: bool = False,
-         num_threads: int = -1, positions: dict[str, np.ndarray] | None = None,
+         num_threads: int = -1, positions: dict[str, np.ndarray] | None = None, rig: bool = False,
          ) -> tuple[pycolmap.Reconstruction | None, list[list[str]] | None]:
     """The mapper's largest model, or with GPS and incremental mapping all its models merged
-    (then also each model's image names)."""
+    (then also each model's image names). With a rig, intrinsics and the rig are kept as
+    given (virtual views we rendered ourselves are exact)."""
     sparse_dir.mkdir(parents=True, exist_ok=True)
     if incremental:
         options = pycolmap.IncrementalPipelineOptions()
         options.num_threads = num_threads
         options.image_names = names
+        if rig:
+            options.ba_refine_focal_length = options.ba_refine_principal_point = False
+            options.ba_refine_extra_params = options.ba_refine_sensor_from_rig = False
         if positions:
             options.use_prior_position = True
             options.use_robust_loss_on_prior_position = True
@@ -204,6 +208,10 @@ def _map(database: Path, image_root: Path, sparse_dir: Path, names: list[str], i
         options = pycolmap.GlobalPipelineOptions()
         options.num_threads = num_threads
         options.image_names = names
+        if rig:
+            options.mapper.refine_sensor_from_rig = False
+            ba = options.mapper.bundle_adjustment
+            ba.refine_focal_length = ba.refine_principal_point = ba.refine_extra_params = False
         reconstructions = pycolmap.global_mapping(database, image_root, sparse_dir, options)
     if not reconstructions:
         return None, None
@@ -298,6 +306,15 @@ def _use_fisheye(database: Path) -> None:
 # re-adjusts as it grows), so 695 frames took 77 min while 200-frame chunks take minutes each.
 CHUNK_FRAMES = 200
 CHUNK_OVERLAP = 40
+# Rig videos (8 views per moment) are chunked by moments; the global mapper handles a
+# minute of Insta360 riding (~100 moments, 800 views) in one piece.
+RIG_CHUNK_MOMENTS = 200
+RIG_CHUNK_OVERLAP = 30
+# Neighbouring moments each view is matched against (all their views, so x8 pairs); keyframes
+# are ~0.7 s apart on a bike.
+RIG_OVERLAP = 5
+# A rig model must register at least this share of its moments.
+MIN_RIG_MOMENTS_RATIO = 0.6
 
 
 def chunks(names: list[str], size: int = CHUNK_FRAMES, overlap: int = CHUNK_OVERLAP) -> list[list[str]]:
@@ -368,9 +385,11 @@ def _place_on_track(rec: pycolmap.Reconstruction, positions: dict[str, np.ndarra
 
 def _solve(database: Path, image_root: Path, names: list[str], sparse_dir: Path, num_threads: int,
            positions: dict[str, np.ndarray] | None, report: StepReporter | None, label: str = "",
-           ) -> tuple[pycolmap.Reconstruction | None, str | None, str, dict | None]:
+           rig: dict | None = None) -> tuple[pycolmap.Reconstruction | None, str | None, str, dict | None]:
     """Map `names` (all or a chunk of the database's frames), retrying with other strategies
     until a result looks healthy: (reconstruction, problem or None, camera model, GPS stats)."""
+    if rig:
+        return _solve_rig(database, image_root, names, sparse_dir, num_threads, positions, report, label, rig)
     rec, problem, camera_model, gps = None, "no reconstruction", "OPENCV", None
     # Global mapping is fast but its positioning step is random and can solve parts of
     # a walk-forward video at different scales; incremental mapping (seeded with the
@@ -420,6 +439,79 @@ def _solve(database: Path, image_root: Path, names: list[str], sparse_dir: Path,
     return rec, problem, camera_model, gps
 
 
+def rig_defect(rec: pycolmap.Reconstruction, names: list[str], views: int) -> str | None:
+    """Why a rig reconstruction is unusable: too few of its moments registered, or too few
+    points per moment (the name-ordered step checks of defect() don't apply to rig views)."""
+    moments = {moment(name) for name in names}
+    registered = {moment(im.name) for im in rec.images.values() if im.has_pose}
+    if len(registered) < MIN_RIG_MOMENTS_RATIO * len(moments):
+        return f"only {len(registered)} of {len(moments)} moments registered"
+    if rec.num_points3D() < MIN_POINTS_PER_FRAME * len(registered):
+        return f"only {rec.num_points3D()} points for {len(registered)} moments"
+    return None
+
+
+def _solve_rig(database: Path, image_root: Path, names: list[str], sparse_dir: Path, num_threads: int,
+               positions: dict[str, np.ndarray] | None, report: StepReporter | None, label: str, rig: dict,
+               ) -> tuple[pycolmap.Reconstruction | None, str | None, str, dict | None]:
+    """_solve for a rig of virtual views: global mapping, then incremental; nothing to seed
+    (the intrinsics are exact) and no fisheye fallback."""
+    rec, problem, gps = None, "no reconstruction", None
+    for attempt, strategy in enumerate(["global", "incremental"]):
+        with step(report, f"map_{strategy}", len(names)):
+            candidate, groups = _map(database, image_root, sparse_dir / f"attempt{attempt}", names,
+                                     strategy == "incremental", num_threads, positions, rig=True)
+        if candidate is None:
+            continue
+        candidate_gps = None
+        if positions:
+            candidate_problem, candidate_gps = _track_check(candidate, positions, groups)
+        else:
+            candidate_problem = rig_defect(candidate, names, len(rig["cam_from_rig"]))
+        log.info("%srig mapping attempt %d (%s): %d images, %d points, %s", label, attempt + 1, strategy,
+                 candidate.num_reg_images(), candidate.num_points3D(), candidate_problem or "ok")
+        if rec is None or (problem is not None and (candidate_problem is None
+                                                    or candidate.num_points3D() > rec.num_points3D())):
+            rec, problem, gps = candidate, candidate_problem, candidate_gps
+        if problem is None:
+            break
+    return rec, problem, rig["model"], gps
+
+
+def moment(name: str) -> str:
+    """A rig image's moment: its video and frame without the view (c33/l0_front/00012.jpg ->
+    c33/00012.jpg); other names unchanged."""
+    parts = name.split("/")
+    return "/".join(parts[:-2] + parts[-1:]) if len(parts) >= 3 else name
+
+
+def rig_chunks(names: list[str], size: int, overlap: int) -> list[list[str]]:
+    """chunks() over moments, so every view of a moment lands in the same chunk."""
+    by_moment: dict[str, list[str]] = {}
+    for name in names:
+        by_moment.setdefault(moment(name), []).append(name)
+    return [[n for m in part for n in by_moment[m]] for part in chunks(list(by_moment), size, overlap)]
+
+
+def apply_rig(database: Path, names: list[str], rig: dict) -> None:
+    """One rig per video prefix (c<id>): images with the same frame name under the views'
+    folders form a frame; cam_from_rig as given (the reference view is the rig)."""
+    configs = []
+    for prefix in sorted({name.split("/")[0] for name in names}):
+        cameras = []
+        for view, matrix in rig["cam_from_rig"].items():
+            ref = view == rig["ref"]
+            cameras.append(pycolmap.RigConfigCamera(
+                image_prefix=f"{prefix}/{view}/", ref_sensor=ref,
+                cam_from_rig=None if ref else pycolmap.Rigid3d(np.array(matrix))))
+        configs.append(pycolmap.RigConfig(cameras=cameras))
+    db = pycolmap.Database.open(str(database))
+    try:
+        pycolmap.apply_rig_config(configs, db)
+    finally:
+        db.close()
+
+
 def _restore_camera(database: Path, camera: pycolmap.Camera) -> None:
     db = pycolmap.Database.open(str(database))
     try:
@@ -432,7 +524,7 @@ def _restore_camera(database: Path, camera: pycolmap.Camera) -> None:
 
 
 def _map_chunks(database: Path, image_root: Path, parts: list[list[str]], sparse_dir: Path, num_threads: int,
-                positions: dict[str, np.ndarray] | None, report: StepReporter | None,
+                positions: dict[str, np.ndarray] | None, report: StepReporter | None, rig: dict | None = None,
                 ) -> tuple[pycolmap.Reconstruction | None, str | None, str, dict | None, dict]:
     """Each chunk mapped on its own, then chained through the frames neighbours share
     (align_overlap); a chain that breaks (a chunk failed, or too little overlap) is placed by
@@ -444,12 +536,13 @@ def _map_chunks(database: Path, image_root: Path, parts: list[list[str]], sparse
     for k, names in enumerate(parts):
         if hasattr(report, "section"):
             report.section(k, len(parts))
-        _restore_camera(database, original)
-        good = [(r, m) for r, p, m in solved if r is not None and p is None and m == "OPENCV"]
-        if good:  # one camera: start from the calibration a previous chunk found
-            _seed_camera(database, next(iter(good[-1][0].cameras.values())))
+        if not rig:
+            _restore_camera(database, original)
+            good = [(r, m) for r, p, m in solved if r is not None and p is None and m == "OPENCV"]
+            if good:  # one camera: start from the calibration a previous chunk found
+                _seed_camera(database, next(iter(good[-1][0].cameras.values())))
         rec, problem, model, _ = _solve(database, image_root, names, sparse_dir / f"chunk{k}", num_threads,
-                                        positions, report, label=f"chunk {k + 1}/{len(parts)}: ")
+                                        positions, report, label=f"chunk {k + 1}/{len(parts)}: ", rig=rig)
         if rec is not None:
             (sparse_dir / f"chunk{k}" / "best").mkdir(parents=True, exist_ok=True)
             rec.write(sparse_dir / f"chunk{k}" / "best")
@@ -532,11 +625,16 @@ def reconstruct_initial(
     positions: dict[str, np.ndarray] | None = None,
     position_sigma: tuple[float, float, float] = (3.0, 3.0, 0.3),
     chunk_frames: int = CHUNK_FRAMES,
+    rig: dict | None = None,
+    mask_root: Path | None = None,
 ) -> InitialResult:
     """num_threads caps every COLMAP step (videos reconstructed side by side split the cores).
     positions: GPS camera positions per image (devices.dji); then each attempt is judged by
     how well it follows the flight track, and incremental mapping uses them as priors.
-    Features and matches are computed once; a long video is mapped in chunks (see chunks)."""
+    Features and matches are computed once; a long video is mapped in chunks (see chunks).
+    rig: the video's virtual views (devices.insta360 rig.json), one PINHOLE camera per view
+    folder, grouped into rig frames before matching. mask_root: feature masks per image
+    (<mask_root>/<name>.png, 0 = ignore), e.g. traffic (worker.pipeline.masks)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     for options in (features.extraction, features.sequential_matching, features.cross_matching):
         options.num_threads = num_threads
@@ -547,12 +645,20 @@ def reconstruct_initial(
     t = time.time()
     reader = pycolmap.ImageReaderOptions()
     reader.camera_model = "OPENCV"
+    if rig:
+        reader.camera_model = rig["model"]
+        reader.camera_params = ",".join(str(v) for v in rig["params"])
+    if mask_root is not None:
+        reader.mask_path = str(mask_root)
     with step(report, "extract", len(image_names)):
         pycolmap.extract_features(
-            database, image_root, image_names=image_names, camera_mode=pycolmap.CameraMode.SINGLE,
+            database, image_root, image_names=image_names,
+            camera_mode=pycolmap.CameraMode.PER_FOLDER if rig else pycolmap.CameraMode.SINGLE,
             reader_options=reader, extraction_options=features.extraction, device=features.device,
         )
     timings["extract"] = time.time() - t
+    if rig:
+        apply_rig(database, image_names, rig)
     if positions:
         log.info("%d GPS position priors", write_position_priors(database, positions, position_sigma))
 
@@ -560,29 +666,38 @@ def reconstruct_initial(
     pairing = pycolmap.SequentialPairingOptions()
     pairing.overlap = sequential_overlap
     pairing.quadratic_overlap = True
+    matching = features.sequential_matching
+    if rig:
+        # Images sort by view folder, so each view's own sequence gives the neighbours; every
+        # view of a neighbouring moment is matched (expand_rig_images), checked against the
+        # rig, and views of one moment aren't matched to each other (their relation is known).
+        pairing.overlap = RIG_OVERLAP
+        pairing.expand_rig_images = True
+        matching.rig_verification = True
+        matching.skip_image_pairs_in_same_frame = True
     with step(report, "match_sequential", len(image_names)):
         pycolmap.match_sequential(
-            database, matching_options=features.sequential_matching, pairing_options=pairing,
-            device=features.device,
+            database, matching_options=matching, pairing_options=pairing, device=features.device,
         )
     timings["match_sequential"] = time.time() - t
 
-    t = time.time()
-    weak_pairs = strengthen_weak_links(database, image_names, features, report)
-    if weak_pairs:
-        timings["match_weak_links"] = time.time() - t
+    if not rig:  # weak links are found in name order, which for rigs runs view by view
+        t = time.time()
+        weak_pairs = strengthen_weak_links(database, image_names, features, report)
+        if weak_pairs:
+            timings["match_weak_links"] = time.time() - t
 
     t = time.time()
     sparse_dir = out_dir / "sparse"
-    parts = chunks(image_names, chunk_frames)
+    parts = rig_chunks(image_names, RIG_CHUNK_MOMENTS, RIG_CHUNK_OVERLAP) if rig else chunks(image_names, chunk_frames)
     chunking = None
     if len(parts) == 1:
         rec, problem, camera_model, gps = _solve(database, image_root, parts[0], sparse_dir, num_threads,
-                                                 positions, report)
+                                                 positions, report, rig=rig)
     else:
         log.info("mapping %d frames in %d chunks of ~%d", len(image_names), len(parts), chunk_frames)
         rec, problem, camera_model, gps, chunking = _map_chunks(database, image_root, parts, sparse_dir,
-                                                                num_threads, positions, report)
+                                                                num_threads, positions, report, rig)
     timings["map"] = time.time() - t
     if rec is None:
         raise RuntimeError("SfM produced no reconstruction (not enough overlap/texture?)")

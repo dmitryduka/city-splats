@@ -41,13 +41,14 @@ class VideoInfo:
     color_space: str
     rotation: int
     tags: dict
+    stream: int = 0  # which video stream (an Insta360 .insv has one per lens)
 
     @property
     def is_hdr(self) -> bool:
         return self.color_transfer in ("arib-std-b67", "smpte2084")
 
 
-def probe(path: Path) -> VideoInfo:
+def probe(path: Path, stream: int = 0) -> VideoInfo:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         check=True,
@@ -55,7 +56,7 @@ def probe(path: Path) -> VideoInfo:
         text=True,
     ).stdout
     meta = json.loads(out)
-    video = next(s for s in meta["streams"] if s["codec_type"] == "video")
+    video = [s for s in meta["streams"] if s["codec_type"] == "video"][stream]
     num, den = (int(x) for x in video["r_frame_rate"].split("/"))
     rotation = 0
     for side_data in video.get("side_data_list", []):
@@ -72,6 +73,7 @@ def probe(path: Path) -> VideoInfo:
         color_space=video.get("color_space", ""),
         rotation=rotation,
         tags=meta["format"].get("tags", {}),
+        stream=stream,
     )
 
 
@@ -149,7 +151,7 @@ def iter_frames(info: VideoInfo, sample_fps: float, max_side: int | None = None,
     # software. Output is bit-identical, but HEVC decode drops ~3.4x wall / ~12x CPU on an M3.
     before, after = _seek(sample_fps, start, count)
     cmd = [
-        "ffmpeg", "-v", "error", "-hwaccel", "auto", *before, "-i", str(info.path),
+        "ffmpeg", "-v", "error", "-hwaccel", "auto", *before, "-i", str(info.path), "-map", f"0:v:{info.stream}",
         "-vf", ",".join(filters), *after, "-fps_mode", "passthrough", "-f", "rawvideo", "-",
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
@@ -188,7 +190,7 @@ def iter_gray(info: VideoInfo, sample_fps: float, width: int = _ANALYSIS_WIDTH, 
     height = int(round(width * src_h / src_w / 2) * 2)
     before, after = _seek(sample_fps, start, count)
     cmd = [
-        "ffmpeg", "-v", "error", "-hwaccel", "auto", *before, "-i", str(info.path),
+        "ffmpeg", "-v", "error", "-hwaccel", "auto", *before, "-i", str(info.path), "-map", f"0:v:{info.stream}",
         "-vf", f"fps={sample_fps},scale={width}:{height}:flags=area,format=gray",
         *after, "-fps_mode", "passthrough", "-f", "rawvideo", "-",
     ]
@@ -273,6 +275,8 @@ def extract_keyframes(
     pool: Executor | None = None,
     segments: int = 4,
     min_segment_seconds: float = 20.0,
+    decode: Callable | None = None,
+    written_name: Callable[[str], str] = lambda name: name,
 ) -> list[Frame]:
     """Motion-spaced keyframes, each the sharpest candidate of its slot.
 
@@ -289,6 +293,10 @@ def extract_keyframes(
     With a `pool`, the video is decoded as up to `segments` time ranges at once (both passes):
     one ffmpeg + analysis thread uses ~half a core and the hardware decoder isn't the limit
     (4 concurrent 4K H.264 decodes on an M3 take as long as one).
+
+    `decode` replaces the second pass (decode_samples' signature without max_side), e.g. a
+    rig's views per keyframe (worker.pipeline.devices.insta360); `written_name` is then where
+    a keyframe's first image lands, relative to out_dir.
     """
     info = probe(video)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -345,10 +353,13 @@ def extract_keyframes(
         if on_progress and done % 10 == 0:
             on_progress(0.8 + 0.19 * done / len(picked))
 
-    decode_samples(info, names, out_dir, ranges, candidate_fps, max_side, pool, written)
+    if decode is None:
+        decode_samples(info, names, out_dir, ranges, candidate_fps, max_side, pool, written)
+    else:
+        decode(info, names, out_dir, ranges, candidate_fps, pool, written)
     frames = [Frame(names[index], ts, score, holdout=False, motion=round(motion, 4))
               for index, ts, score, motion in picked]
-    missing = [f.name for f in frames if not (out_dir / f.name).exists()]
+    missing = [f.name for f in frames if not (out_dir / written_name(f.name)).exists()]
     if missing:
         raise RuntimeError(f"{len(missing)} keyframes were not decoded (first: {missing[0]})")
     for k in range(holdout_every - 1, len(frames), holdout_every):

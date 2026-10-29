@@ -51,11 +51,15 @@ from worker.pipeline.cleanup import clean_sparse, clean_splats, points_as_splats
 from worker.pipeline.dense import (
     DenseStats, align_frames, fuse_frames, predict_depth,
 )
+from worker.pipeline.devices import image_names
+from worker.pipeline.devices.insta360 import RIG_FILE, read_rig
 from worker.pipeline.export import export_layers
-from worker.pipeline.georef import georeference
+from worker.pipeline.georef import anchor_offsets, georeference, georeference_anchors, scene_from_anchors
 from worker.pipeline.features import DEFAULT_FEATURES, feature_config
 from worker.pipeline.ingest import probe
 from worker.pipeline.lod import build_lod
+from worker.pipeline.masks import MASKS_DIR
+from worker.pipeline.sfm import moment
 from worker.pipeline.sky import remove_sky
 from worker.pipeline.pieces import Piece, apply, compose, link_piece
 from worker.pipeline.splat import Snapshot, TrainingStopped
@@ -176,8 +180,8 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
         # 1. Ingest (usually run ahead by the prefetcher)
         frames, seconds = _await(prefetch.ingest(c, scene.slug, retry=True), progress, "ingest")
         timing.record("ingest", info.duration, seconds)
-        names = [f"{c.image_dir_name}/{f['name']}" for f in frames]
-        metrics |= {"keyframes": len(names), "holdouts": sum(f["holdout"] for f in frames),
+        names = image_names(SCENES_ROOT / scene.slug / "images", c.image_dir_name, [f["name"] for f in frames])
+        metrics |= {"keyframes": len(frames), "holdouts": sum(f["holdout"] for f in frames),
                     "ingest_seconds": seconds}
         for stage in ("sfm", "register", "layers"):
             if any(name == stage for name, _ in stages):
@@ -213,7 +217,21 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
         piece = Piece(sfm.reconstruction_path, sfm.database_path, contribution_id=c.id,
                       gps=gps if gps.exists() else None)
         pieces = scene_pieces(head) if head is not None else []
-        if head is not None and rejection is None:
+        # Hand-given start/end positions (scene settings GPS_ANCHORS, for videos without a GPS
+        # track) can place a video the scene has no view in common with.
+        anchors = scene_setting(scene.settings, "GPS_ANCHORS", {}).get(c.image_dir_name)
+        head_geo = head.metrics.get("geo") if head is not None else None
+        by_anchors = None
+        if head_geo and anchors and rejection is None:
+            by_anchors = scene_from_anchors(pycolmap.Reconstruction(piece.reconstruction), c.image_dir_name,
+                                            anchors, head_geo)
+            min_e, min_n, max_e, max_n = head_geo["extent"]
+            far = all(np.hypot(max(min_e - e, 0, e - max_e), max(min_n - n, 0, n - max_n)) > LINK_RADIUS_M
+                      for e, n in anchor_offsets(anchors, head_geo))
+            if by_anchors is not None and far:  # nothing to match against out there
+                piece.scene_from_piece = by_anchors
+                metrics |= {"strategy": "anchors", "gate": "placed by GPS anchors, away from the scene's cameras"}
+        if head is not None and rejection is None and "strategy" not in metrics:
             pairs = -(-sfm.num_registered // LINK_QUERY_STRIDE) * LINK_NEIGHBORS
             progress.start("register", substeps=[("match_retrieval", pairs)], rate_suffix=features.name)
             with prefetch.paused():
@@ -225,6 +243,9 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
                         "sfm_timings": metrics["sfm_timings"] | {k: round(v, 1) for k, v in link.timings.items()}}
             if link.ok:
                 piece.scene_from_piece = link.scene_from_piece
+            elif by_anchors is not None:
+                piece.scene_from_piece = by_anchors
+                metrics |= {"strategy": "anchors", "gate": f"placed by GPS anchors ({link.reason})"}
             else:
                 rejection = f"could not place the video in the scene: {link.reason}"
         if rejection:
@@ -240,7 +261,10 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
         metrics |= {"points": rec.num_points3D(), "points_before": head.metrics.get("points") if head else None,
                     "pieces": [p.to_json(DATA_ROOT) for p in pieces]}
         export_layers(rec, work / "layers", lambda name: seq_by_dir.get(name.split("/")[0], 1) - 1)
-        if geo := georeference(rec, [p.gps for p in pieces if p.gps]):
+        # No GPS track (e.g. an Insta360 ride): positions given by hand, per video, in the
+        # scene's settings ({"c<id>": {"start": [lat, lon], "end": [lat, lon]}}).
+        if geo := (georeference(rec, [p.gps for p in pieces if p.gps])
+                   or georeference_anchors(rec, scene_setting(scene.settings, "GPS_ANCHORS", {}))):
             metrics["geo"] = geo
         timing.record("layers", len(names), progress.finish())
 
@@ -317,7 +341,9 @@ def _densify(head: Version | None, rec: pycolmap.Reconstruction, image_root: Pat
         predict_depth(image_root, names, depth_dir, scene_setting(settings, "DEPTH_MODEL", DEPTH_MODEL),
                       on_progress=lambda done, total: progress.update(
                           0.6 * done / total, detail=f"Predicting depth {done}/{total}"))
-    frames, footprint = align_frames(rec, names, depth_dir, stride=stride)
+    # Name order is capture order per view (a rig's views each in their own folder), so a
+    # frame's neighbours in the list look the same way.
+    frames, footprint = align_frames(rec, sorted(names), depth_dir, stride=stride)
     parent = head.metrics.get("dense_tiles") if head else None
     voxel = parent["voxel"] if parent else footprint * (scene_from_piece.scale if scene_from_piece else 1.0)
     spill = Spill(dense_dir / "spill", voxel)
@@ -325,7 +351,7 @@ def _densify(head: Version | None, rec: pycolmap.Reconstruction, image_root: Pat
     def sink(xyz: np.ndarray, rgb: np.ndarray) -> None:
         spill.add(apply(scene_from_piece, xyz).astype(np.float32) if scene_from_piece else xyz, rgb)
 
-    fused = fuse_frames(frames, image_root, sink, stride=stride,
+    fused = fuse_frames(frames, image_root, sink, stride=stride, mask_root=image_root.parent / MASKS_DIR,
                         on_progress=lambda done, total: progress.update(
                             0.6 + 0.2 * done / total, detail=f"Fusing depth maps {done}/{total}"))
     shutil.rmtree(dense_dir / "depth", ignore_errors=True)
@@ -438,6 +464,15 @@ def _train_global(v: Version, quality: str, steps: int, max_resolution: int, rec
                  "eval": eval_results(work / "train")}
 
 
+def _held_out(names: list[str]) -> set[str]:
+    """Every 8th moment by name, all its images: a rig's views of one moment (worker.pipeline.
+    devices.insta360) overlap their neighbours, so training on some of them would leak the
+    held-out ones. For ordinary videos a moment is a frame."""
+    moments = sorted({moment(name) for name in names})[::8]
+    held = set(moments)
+    return {name for name in names if moment(name) in held}
+
+
 def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolution: int, reconstruction: Path,
                   rec: pycolmap.Reconstruction, image_root: Path, work: Path, progress: Progress,
                   timing: TimingModel, show_preview: Callable[[list[Path], int], None]) -> tuple[Path, dict]:
@@ -455,7 +490,7 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
     # Held out: every 8th keyframe by name, as one global Brush run would hold out, so block
     # and global splats are measured on the same unseen frames.
     names = sorted(image.name for image in rec.images.values() if image.has_pose)
-    held_out = set(names[::8])
+    held_out = _held_out(names)
     full = pycolmap.Reconstruction(reconstruction)
 
     train_root, frames = image_root, None
@@ -579,9 +614,16 @@ def _videos(v: Version) -> list[Video]:
     videos = []
     for c in contributions:
         prefix = "c" + Path(c.video_path).name.split("_", 1)[0]
+        if read_rig(source.parent / "images" / prefix):
+            continue  # a rig's views are rendered at ingest (worker.pipeline.devices.insta360)
         frames = json.loads((source / prefix / "frames.json").read_text())
         videos.append(Video(prefix, Path(c.video_path), frames, DECODE_THREADS))
     return videos
+
+
+def _rig_prefixes(v: Version) -> set[str]:
+    images = SCENES_ROOT / Path(v.reconstruction_path).parts[1] / "images"
+    return {p.parent.name for p in images.glob(f"*/{RIG_FILE}")}
 
 
 def _training_frames(v: Version, scene: Scene, full: pycolmap.Reconstruction, rec: pycolmap.Reconstruction,
@@ -603,8 +645,15 @@ def _training_frames(v: Version, scene: Scene, full: pycolmap.Reconstruction, re
         substeps += [("pose", gaps)]
     progress.start("frames", substeps=substeps)
 
+    # Rig videos train on the views rendered at ingest, as they are.
+    rigs = _rig_prefixes(v)
+    for prefix in rigs:
+        link = train_root / prefix
+        if not link.exists():
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to((image_root / prefix).resolve())
     with progress.step("cameras", stats.keyframes):
-        cameras = shared_cameras(full, stats)
+        cameras = shared_cameras(full, stats, skip=rigs)
         copy_poses(full, rec)
         progress.counts(stats.keyframes, stats.keyframes)
 

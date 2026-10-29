@@ -37,9 +37,11 @@ from backend.app.config import DEPTH_MODEL, SCENES_ROOT, scene_setting
 from backend.app.db import session_scope
 from backend.app.models import Contribution, Scene, Version
 from worker.pipeline.dense import predict_depth
+from worker.pipeline.devices import image_names, insta360
 from worker.pipeline.devices.dji import read_track
 from worker.pipeline.features import DEFAULT_FEATURES
 from worker.pipeline.ingest import extract_keyframes
+from worker.pipeline.masks import MASKS_DIR, MOVABLE_DIR, SKY_DIR, movable_masks
 from worker.pipeline.sfm import InitialResult
 
 log = logging.getLogger(__name__)
@@ -402,18 +404,30 @@ class Prefetcher:
                 images = SCENES_ROOT / slug / "images" / c.image_dir_name
                 shutil.rmtree(work, ignore_errors=True)
                 shutil.rmtree(images, ignore_errors=True)
+                for masks in (MASKS_DIR, MOVABLE_DIR, SKY_DIR):  # cached by image name
+                    shutil.rmtree(SCENES_ROOT / slug / masks / c.image_dir_name, ignore_errors=True)
                 work.mkdir(parents=True)
                 started = time.time()
+                rig = insta360.is_insv(Path(c.video_path))
                 frames = extract_keyframes(
                     Path(c.video_path), images, pool=self.decode_pool, segments=self.decode_threads,
                     on_progress=lambda f: relay(f, f"Decoding {f:.0%} of the video, picking sharp frames by motion"),
+                    **({"decode": insta360.decode_views, "written_name": lambda n: f"{insta360.REF_VIEW}/{n}"}
+                       if rig else {}),
                 )
                 (work / "frames.json").write_text(json.dumps([f.__dict__ for f in frames]))
-                marker.write_text(json.dumps({"seconds": round(time.time() - started, 1)}))
+                done = {"seconds": round(time.time() - started, 1)}
+                if rig:
+                    # Street rides: traffic and the rider are masked before SfM sees them.
+                    names = image_names(SCENES_ROOT / slug / "images", c.image_dir_name, [f["name"] for f in frames])
+                    done["masks"] = movable_masks(
+                        SCENES_ROOT / slug, SCENES_ROOT / slug / "images", names,
+                        on_progress=lambda n, total: relay(n / total, f"Masking traffic {n}/{total}"))
+                marker.write_text(json.dumps(done))
                 log.info("contribution %s: %d keyframes in %.0fs", c.id, len(frames), time.time() - started)
             frames = json.loads((work / "frames.json").read_text())
             self._counts[("ingest", c.id)] = (len(frames), len(frames))
-            names = [f"{c.image_dir_name}/{f['name']}" for f in frames]
+            names = image_names(SCENES_ROOT / slug / "images", c.image_dir_name, [f["name"] for f in frames])
             self.piece(c, slug, names)
             self.depth(c, slug, names)
             return frames, json.loads(marker.read_text())["seconds"]

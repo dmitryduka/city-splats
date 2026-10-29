@@ -12,6 +12,8 @@ from collections.abc import Callable
 from functools import cache
 from pathlib import Path
 
+from worker.pipeline.masks import MASKS_DIR
+
 from . import Snapshot, TrainingStopped
 
 _EXPORT_RE = re.compile(r"splat_(\d+)\.ply$")
@@ -66,6 +68,11 @@ class BrushTrainer:
         (dataset / "sparse").mkdir(parents=True)
         (dataset / "images").symlink_to(image_root.resolve())
         (dataset / "sparse" / "0").symlink_to(reconstruction.resolve())
+        # Masks next to the images (worker.pipeline.masks: traffic, 0 = not trained on);
+        # Brush pairs masks/<subpath>/<name>.png with images/<subpath>/<name>.
+        masks = image_root.resolve().parent / MASKS_DIR
+        if masks.is_dir():
+            (dataset / "masks").symlink_to(masks)
         if init_ply is not None:
             shutil.copyfile(init_ply, dataset / "init.ply")
 

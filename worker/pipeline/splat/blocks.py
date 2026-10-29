@@ -150,9 +150,10 @@ def block_model(rec: pycolmap.Reconstruction, geo: dict, block: Block) -> pycolm
     margin (the initialisation, and what floaters are carved against)."""
     sub = pycolmap.Reconstruction(rec)
     keep = set(block.images)
-    for image in list(sub.images.values()):
-        if image.has_pose and image.name not in keep:
-            sub.deregister_frame(image.frame_id)
+    # A rig frame (all views of one moment) stays if any of its views is the block's.
+    frames = {image.frame_id for image in sub.images.values() if image.has_pose and image.name in keep}
+    for frame_id in {image.frame_id for image in sub.images.values() if image.has_pose} - frames:
+        sub.deregister_frame(frame_id)
     ids = np.array(list(sub.points3D.keys()))
     xy = _to_map(np.array([sub.points3D[i].xyz for i in ids]), map_from_scene(geo))[:, :2]
     distance = np.min([_rect_distance(xy, c) for c in block.cells], axis=0)
