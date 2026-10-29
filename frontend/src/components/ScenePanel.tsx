@@ -288,20 +288,6 @@ function TrainingReport({ report, skyRemoved }: { report: TrainReport; skyRemove
   );
 }
 
-type LiveStepReport = { block: number; blocks: number; step: number; steps: number; splats: number; at: string };
-
-/** Brush's latest logged step (every 200 steps), for a run whose worker predates reporting it
- * in train_detail; written by a stopgap script. TODO: remove once that run (version 31) ends. */
-function LiveStep({ live }: { live: LiveStepReport }) {
-  const at = new Date(live.at);
-  return (
-    <div className="muted small">
-      Brush: block {live.block}/{live.blocks} · step {live.step}/{live.steps} · {(live.splats / 1e6).toFixed(1)}M splats ·
-      logged {at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-    </div>
-  );
-}
-
 function VersionRow({
   v,
   state,
@@ -373,7 +359,6 @@ function VersionRow({
                 <div style={{ width: `${v.train_progress * 100}%` }} />
               </div>
               {v.train_detail && <div className="muted small">{v.train_detail}</div>}
-              {v.metrics.live_step != null && <LiveStep live={v.metrics.live_step as LiveStepReport} />}
               {v.train_timeline && v.train_timeline.length > 0 && <Timeline timeline={v.train_timeline} />}
               {v.metrics.training_report != null && (
                 <TrainingReport report={v.metrics.training_report as TrainReport}
