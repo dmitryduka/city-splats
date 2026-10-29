@@ -58,6 +58,15 @@ TRAIN_DENSE_INIT = int(os.environ.get("TRAIN_DENSE_INIT", 0))
 # then renders empty. Every 4th view of Achapnyak Ultra's first block (447 of 1786) still saw
 # each splat 68 times (median); masks took 1.6 s/frame on the M3's CPU. 0 keeps the sky.
 TRAIN_SKY_EVERY = int(os.environ.get("TRAIN_SKY_EVERY", 4))
+# A version's blocks are those of its nearest block-trained ancestor plus new ones where its
+# videos looked outside them (worker.pipeline.splat.blocks); an ancestor block is trained again
+# only if TRAIN_STALE_FRAMES new frames look into it, or its margin gained new frames beyond
+# TRAIN_STALE_MARGIN of its own frames (margin frames only shape splats near its edge, which
+# the crop to its cells mostly drops). Others keep the ancestor's splats. Achapnyak v6's one
+# 412-frame video put 128-284 frames into the 2 blocks it covered and none into the other 5
+# (nor into their margins); 10 frames ignores a video that only glimpses a block.
+TRAIN_STALE_FRAMES = int(os.environ.get("TRAIN_STALE_FRAMES", 10))
+TRAIN_STALE_MARGIN = float(os.environ.get("TRAIN_STALE_MARGIN", 0.1))
 UNIFORM_INIT_POINTS = int(os.environ.get("UNIFORM_INIT_POINTS", 500_000))
 AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "none")
 TRAIN_PREVIEW_EVERY = int(os.environ.get("TRAIN_PREVIEW_EVERY", 1000))

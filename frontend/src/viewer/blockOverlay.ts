@@ -2,21 +2,38 @@ import * as THREE from "three";
 import type { Geo } from "./mapTiles";
 
 /** A splat training block (worker.pipeline.splat.blocks): its ground cells in the map frame
- * ([minE, minN, maxE, maxN], metres) and how far training has got with it. */
+ * ([minE, minN, maxE, maxN], metres) and how far training has got with it. "reused": its
+ * splats are an earlier version's (`from`), which the new videos left alone; "stale": the new
+ * videos changed it (`reason`) and the version shows the earlier splats until it trains. */
 export type BlockOverlay = {
   key: string;
   cells: [number, number, number, number][];
-  status: "done" | "training" | "queued";
+  status: "done" | "training" | "queued" | "reused" | "stale";
   /** Position in training order (1-based) and the number of blocks. */
   index: number;
   count: number;
   psnr?: number | null;
+  from?: number | null;
+  reason?: string | null;
+  /** The map frame the cells are in (scene_from_map) when it is an earlier version's: blocks
+   * keep the frame of the version they were first trained in. */
+  frame?: number[][] | null;
 };
 
 export const BLOCK_COLORS: Record<BlockOverlay["status"], string> = {
   done: "#5cc87a",
   training: "#ffb340",
   queued: "#8fa3b8",
+  reused: "#5aa9e6",
+  stale: "#ef6a5a",
+};
+
+export const BLOCK_LABELS: Record<BlockOverlay["status"], string> = {
+  done: "trained",
+  training: "training",
+  queued: "queued",
+  reused: "reused",
+  stale: "to train",
 };
 
 /** Cells are clipped to the flight plus this margin: blocks own all ground nearest to them,
@@ -94,7 +111,8 @@ export type BlockLayer = { group: THREE.Group; dispose: () => void };
 export function buildBlocks(geo: Geo, blocks: BlockOverlay[]): BlockLayer {
   const group = new THREE.Group();
   group.matrixAutoUpdate = false;
-  group.matrix.set(...(geo.scene_from_map.flat() as Parameters<THREE.Matrix4["set"]>));
+  const frame = blocks.find((b) => b.frame)?.frame ?? geo.scene_from_map;
+  group.matrix.set(...(frame.flat() as Parameters<THREE.Matrix4["set"]>));
   const [minE, minN, maxE, maxN] = geo.extent;
   const area: Rect = [minE - MARGIN, minN - MARGIN, maxE + MARGIN, maxN + MARGIN];
   const disposables: { dispose: () => void }[] = [];
@@ -108,7 +126,8 @@ export function buildBlocks(geo: Geo, blocks: BlockOverlay[]): BlockLayer {
     if (!cells.length) continue;
     const color = new THREE.Color(BLOCK_COLORS[block.status]);
 
-    const fill = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: block.status === "training" ? 0.28 : 0.14,
+    const fill = new THREE.MeshBasicMaterial({ color, transparent: true,
+      opacity: block.status === "training" || block.status === "stale" ? 0.28 : 0.14,
       depthTest: false, depthWrite: false, side: THREE.DoubleSide });
     disposables.push(fill);
     for (const [x0, y0, x1, y1] of cells) {
@@ -137,7 +156,9 @@ export function buildBlocks(geo: Geo, blocks: BlockOverlay[]): BlockLayer {
     // Label over the block's largest cell, sized to it.
     const big = cells.reduce((a, b) => ((b[2] - b[0]) * (b[3] - b[1]) > (a[2] - a[0]) * (a[3] - a[1]) ? b : a));
     const status = block.status === "done" ? (block.psnr != null ? `${block.psnr.toFixed(2)} dB` : "trained")
-      : block.status;
+      : block.status === "reused" ? `from v${block.from}`
+        : block.status === "stale" ? `to train${block.reason ? ` (${block.reason})` : ""}`
+          : block.status;
     const sprite = label(`${block.index}/${block.count} ${block.key} · ${status}`, BLOCK_COLORS[block.status]);
     sprite.scale.set(labelHeight * sprite.userData.aspect, labelHeight, 1);
     sprite.position.set((big[0] + big[2]) / 2, (big[1] + big[3]) / 2, LIFT + 2);
@@ -157,27 +178,35 @@ export function buildBlocks(geo: Geo, blocks: BlockOverlay[]): BlockLayer {
   };
 }
 
-type BlockResult = { cells?: Rect[]; eval?: { psnr?: number } | null };
+type BlockResult = { cells?: Rect[]; eval?: { psnr?: number } | null; reused?: boolean; from?: number };
+type PlannedBlock = { key: string; cells: Rect[]; status?: "reused" | "stale"; from?: number; reason?: string };
 
 /** A version's blocks with their status, from its metrics: the plan stored when training
- * started, the running report's finished blocks, or a finished run's blocks (of the viewed
- * splat kind if it has them). */
+ * started (or when the version took over an earlier version's blocks: which are reused and
+ * which stale), the running report's finished blocks, or a finished run's blocks (of the
+ * viewed splat kind if it has them). */
 export function blockOverlays(metrics: Record<string, unknown>, training: boolean, kind: string | null): BlockOverlay[] {
   const runs = Object.entries(metrics)
     .filter(([k, m]) => k.startsWith("splat_") && (m as { blocks?: unknown })?.blocks)
     .sort(([a]) => (a === `splat_${kind}` ? -1 : 1));
   const finished = training ? null : ((runs[0]?.[1] as { blocks: Record<string, BlockResult> } | undefined)?.blocks ?? null);
   const report = (metrics.training_report as { blocks?: Record<string, BlockResult> } | undefined)?.blocks ?? {};
-  const plan = (finished && Object.entries(finished).map(([key, b]) => ({ key, cells: b.cells ?? [] })))
-    ?? (metrics.block_plan as { key: string; cells: Rect[] }[] | undefined) ?? [];
+  const planned = (metrics.block_plan as PlannedBlock[] | undefined) ?? [];
+  const plan: PlannedBlock[] = (finished && Object.entries(finished).map(([key, b]) => ({ key, cells: b.cells ?? [] })))
+    ?? planned;
+  const frame = (metrics.block_geo as number[][] | undefined) ?? null;
   let current = training;
   return plan.map(({ key, cells }, i) => {
     const result = finished?.[key] ?? report[key];
-    let status: BlockOverlay["status"] = result ? "done" : "queued";
+    const entry = planned.find((p) => p.key === key);
+    let status: BlockOverlay["status"] = result ? (result.reused ? "reused" : "done") : "queued";
     if (!result && current) {
       status = "training";
       current = false;
+    } else if (!result && !training && entry?.status) {
+      status = entry.status; // not trained in this version yet
     }
-    return { key, cells, status, index: i + 1, count: plan.length, psnr: result?.eval?.psnr ?? null };
+    return { key, cells, status, index: i + 1, count: plan.length, psnr: result?.eval?.psnr ?? null,
+      from: result?.from ?? entry?.from ?? null, reason: entry?.reason ?? null, frame };
   });
 }
