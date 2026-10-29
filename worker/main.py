@@ -20,7 +20,7 @@ from backend.app.db import init_db, session_scope
 from backend.app.models import Contribution, Scene, Version, utcnow
 from worker import compute
 from worker.prefetch import Prefetcher
-from worker.runner import process, train_version
+from worker.runner import inherit_blocks, process, train_version
 
 log = logging.getLogger("worker")
 
@@ -74,6 +74,21 @@ def claim_training() -> int | None:
         return None
 
 
+def inherit_pending(tried: set[int]) -> None:
+    """HEAD versions published before blocks were reused take over their trained ancestor's
+    blocks once (runner.inherit_blocks; new versions do when published)."""
+    with session_scope() as session:
+        heads = [session.get(Version, s.head_version_id) for s in session.exec(select(Scene)).all() if s.head_version_id]
+    for v in heads:
+        if v is None or v.id in tried or v.splat_url or v.train_status or "block_plan" in v.metrics:
+            continue
+        tried.add(v.id)
+        try:
+            inherit_blocks(v.id)
+        except Exception:  # noqa: BLE001 - it only saves the version waiting for training
+            log.exception("version %s: could not take over the earlier version's blocks", v.id)
+
+
 def run_training(version_id: int) -> None:
     log.info("training splat for version %s", version_id)
     try:
@@ -96,9 +111,11 @@ def main() -> None:
     recover_interrupted()
     prefetch = Prefetcher(INGEST_VIDEOS, DECODE_THREADS, SFM_VIDEOS)
     prefetch.start()
+    inherited: set[int] = set()
     while True:
         contribution_id = claim_next()
         if contribution_id is None:
+            inherit_pending(inherited)
             version_id = claim_training()
             if version_id is None:
                 time.sleep(2)

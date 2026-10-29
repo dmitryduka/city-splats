@@ -8,8 +8,8 @@ into a block (a frame looks where the median of its observed SfM points lies); s
 merged into neighbours. Every block trains the full steps: held-out PSNR was still rising by
 0.6-1.3 dB per 500-750 steps when Achapnyak v5's blocks stopped at 1750-2450 steps scaled to
 their frames (Brush grows splats and decays the learning rate over the run's total steps). The grid is
-fixed and leaves split only where frames were added, so a block whose frames didn't change can
-be reused by the next version.
+fixed, and a later version keeps the trained version's blocks (plan_blocks `keep`), planning
+only where its videos looked outside them, so a block whose frames didn't change can be reused.
 
 Each block trains on the frames looking into it and into a margin around it, from the SfM
 points there, and keeps only the splats closest to its own cells (empty space goes to the
@@ -54,16 +54,8 @@ def _to_map(xyz: np.ndarray, enu_from_scene: np.ndarray) -> np.ndarray:
     return xyz @ enu_from_scene[:3, :3].T + enu_from_scene[:3, 3]
 
 
-def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m: float = 25.0,
-                margin: float = 0.25, min_margin_m: float = 30.0, max_margin_m: float = 100.0,
-                max_margin_share: float = 0.5) -> list[Block]:
-    """Quadtree leaves holding at most `budget` frames (or `min_side_m` wide). A parent's
-    leaves with under budget/4 frames each are grouped into one block (a split leaves some
-    quadrants nearly empty). A block trains on its own frames plus the frames looking within
-    a margin of its cells (`margin` of its frames' look extent, clamped to min/max_margin_m),
-    nearest first and at most max_margin_share of its own: Brush picks frames uniformly, and
-    a block whose margin pulled in the dense centre of the scene (2741 frames for 482 of its
-    own) would spend most of its steps elsewhere, the dilution blocks are meant to avoid."""
+def _looks(rec: pycolmap.Reconstruction, geo: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Posed frames with enough SfM points, and where each looks (map frame, metres)."""
     enu_from_scene = map_from_scene(geo)
     ids = np.array(list(rec.points3D.keys()))
     pos = dict(zip(ids.tolist(), _to_map(np.array([rec.points3D[i].xyz for i in ids]), enu_from_scene)[:, :2]))
@@ -75,10 +67,76 @@ def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m
         if len(seen) >= 20:
             names.append(image.name)
             looks.append(np.median(seen, axis=0))
-    names, looks = np.array(names), np.array(looks)
+    return np.array(names), np.array(looks).reshape(-1, 2)
+
+
+def _cell(level: int, x: int, y: int) -> Rect:
+    side = 2 * ROOT_HALF_M / 2**level
+    return (-ROOT_HALF_M + x * side, -ROOT_HALF_M + y * side,
+            -ROOT_HALF_M + (x + 1) * side, -ROOT_HALF_M + (y + 1) * side)
+
+
+def _cell_index(rect: Rect | list[float]) -> tuple[int, int, int]:
+    side = rect[2] - rect[0]
+    return (round(np.log2(2 * ROOT_HALF_M / side)), round((rect[0] + ROOT_HALF_M) / side),
+            round((rect[1] + ROOT_HALF_M) / side))
+
+
+def _quadrant(look: np.ndarray, level: int) -> tuple[int, int, int]:
+    side = 2 * ROOT_HALF_M / 2**level
+    return (level, int(np.floor((look[0] + ROOT_HALF_M) / side)), int(np.floor((look[1] + ROOT_HALF_M) / side)))
+
+
+def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m: float = 25.0,
+                margin: float = 0.25, min_margin_m: float = 30.0, max_margin_m: float = 100.0,
+                max_margin_share: float = 0.5, keep: list[dict] | None = None,
+                release: float = 1.5) -> list[Block]:
+    """Quadtree leaves holding at most `budget` frames (or `min_side_m` wide). A parent's
+    leaves with under budget/4 frames each are grouped into one block (a split leaves some
+    quadrants nearly empty). A block trains on its own frames plus the frames looking within
+    a margin of its cells (`margin` of its frames' look extent, clamped to min/max_margin_m),
+    nearest first and at most max_margin_share of its own: Brush picks frames uniformly, and
+    a block whose margin pulled in the dense centre of the scene (2741 frames for 482 of its
+    own) would spend most of its steps elsewhere, the dilution blocks are meant to avoid.
+
+    `keep`: an earlier version's blocks ({key, cells, grow, frames}), which keep their keys, cells and
+    margins; only frames looking outside all of them are planned into new blocks (from the
+    empty quadrants they fall in), so a video changes the blocks it looks into and no others.
+    Planning everything again moved the top of the tree: one 412-frame video added to
+    Achapnyak v5 changed all 7 blocks. A kept block that grew past `release` x the budget (the
+    most merging makes) is planned again from its cells: it trains anyway, and as one block
+    its 15000 steps would be spread over more frames than any other's."""
+    names, looks = _looks(rec, geo)
+    keep = keep or []
+
+    # Frames inside the kept blocks' cells (quadtree leaves, so at most one holds a frame).
+    leaf_owner = {_cell_index(c): i for i, b in enumerate(keep) for c in b["cells"]}
+    owner, owner_leaf = np.full(len(names), -1), [None] * len(names)
+    for level in sorted({leaf[0] for leaf in leaf_owner}):
+        for j in np.flatnonzero(owner < 0):
+            leaf = _quadrant(looks[j], level)
+            if leaf in leaf_owner:
+                owner[j], owner_leaf[j] = leaf_owner[leaf], leaf
+    released = {i for i, b in enumerate(keep)
+                if (n := (owner == i).sum()) > release * budget and n > b.get("frames", 0)}
+    # Quadrants above a kept leaf; any other quadrant a frame reaches holds no kept block.
+    inner = {(level - d, x >> d, y >> d) for level, x, y in leaf_owner for d in range(1, level + 1)}
+    seeds: dict[tuple[int, int, int], list[int]] = {}
+    for j in range(len(names)):
+        if owner[j] >= 0 and owner[j] not in released:
+            continue
+        if owner[j] >= 0:
+            seeds.setdefault(owner_leaf[j], []).append(j)
+            continue
+        level = 0
+        while _quadrant(looks[j], level) in inner:
+            level += 1
+        seeds.setdefault(_quadrant(looks[j], level), []).append(j)
+    if not keep:
+        seeds = {(0, 0, 0): list(range(len(names)))}
 
     leaves: list[tuple[int, int, int, np.ndarray]] = []
-    stack = [(0, 0, 0, np.arange(len(names)))]
+    stack = [(*seed, np.array(idx, dtype=int)) for seed, idx in seeds.items()]
     while stack:
         level, x, y, idx = stack.pop()
         side = 2 * ROOT_HALF_M / 2**level
@@ -94,12 +152,14 @@ def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m
                 if len(sub):
                     stack.append((level + 1, 2 * x + dx, 2 * y + dy, sub))
 
-    def cell(level: int, x: int, y: int) -> Rect:
-        side = 2 * ROOT_HALF_M / 2**level
-        return (-ROOT_HALF_M + x * side, -ROOT_HALF_M + y * side,
-                -ROOT_HALF_M + (x + 1) * side, -ROOT_HALF_M + (y + 1) * side)
-
     groups: dict[str, list[tuple[int, int, int, np.ndarray]]] = {}
+    fixed: dict[str, dict] = {}
+    for i, b in enumerate(keep):
+        if i not in released:
+            fixed[b["key"]] = b
+            groups[b["key"]] = [(*_cell_index(c), np.array([j for j in np.flatnonzero(owner == i)
+                                                            if owner_leaf[j] == _cell_index(c)], dtype=int))
+                                for c in b["cells"]]
     for leaf in sorted(leaves, key=lambda leaf: leaf[:3]):
         level, x, y, idx = leaf
         small = len(idx) < budget // 4 and level > 0
@@ -108,15 +168,16 @@ def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m
 
     # Every block trains the full steps (a short run stops growing splats and anneals early,
     # whatever its frames), so a 40-frame block costs as much as a full one: blocks under half
-    # the budget join their nearest block while it stays under 1.5x the budget.
+    # the budget join their nearest block while it stays under 1.5x the budget. Kept blocks
+    # don't move into others (they would all change); new ones may join them.
     def size(key: str) -> int:
         return sum(len(m[3]) for m in groups[key])
 
     def gap(a: str, b: str) -> float:
-        return min(_rect_gap(cell(*m[:3]), cell(*n[:3])) for m in groups[a] for n in groups[b])
+        return min(_rect_gap(_cell(*m[:3]), _cell(*n[:3])) for m in groups[a] for n in groups[b])
 
     while True:
-        small = sorted((size(k), k) for k in groups if size(k) < budget // 2)
+        small = sorted((size(k), k) for k in groups if size(k) < budget // 2 and k not in fixed)
         merges = [(gap(k, other), k, other) for n, k in small for other in groups
                   if other != k and size(other) + n <= 1.5 * budget]
         if not merges:
@@ -126,13 +187,20 @@ def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m
 
     blocks = []
     for key, members in groups.items():
-        idx = np.concatenate([m[3] for m in members])
-        cells = [cell(*m[:3]) for m in members]
-        extent = float((looks[idx].max(0) - looks[idx].min(0)).max())
-        grow = min(max(margin * extent, min_margin_m), max_margin_m)
-        distance = np.min([_rect_distance(looks, c) for c in cells], axis=0)
-        near = np.flatnonzero((distance > 0) & (distance <= grow))
-        near = near[np.argsort(distance[near], kind="stable")][:int(max_margin_share * len(idx))]
+        idx = np.concatenate([m[3] for m in members]).astype(int)
+        cells = [_cell(*m[:3]) for m in members]
+        if key in fixed and len(members) == len(fixed[key]["cells"]):
+            grow = float(fixed[key]["grow"])
+        elif len(idx):
+            extent = float((looks[idx].max(0) - looks[idx].min(0)).max())
+            grow = min(max(margin * extent, min_margin_m), max_margin_m)
+        else:
+            grow = min_margin_m
+        near = np.array([], dtype=int)
+        if len(idx):
+            distance = np.min([_rect_distance(looks, c) for c in cells], axis=0)
+            near = np.flatnonzero((distance > 0) & (distance <= grow))
+            near = near[np.argsort(distance[near], kind="stable")][:int(max_margin_share * len(idx))]
         blocks.append(Block(key, cells, grow, sorted(names[idx].tolist()),
                             sorted(names[np.concatenate([idx, near])].tolist())))
     return blocks

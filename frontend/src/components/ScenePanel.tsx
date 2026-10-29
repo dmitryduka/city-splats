@@ -230,7 +230,18 @@ const TRAIN_OPTIONS: { quality: TrainQuality; label: string; title: string }[] =
 ];
 
 type SkyReport = { total: number; sky: number; above_roofs: number };
-type BlockReport = { frames: number; train_frames: number; eval?: { psnr: number } | null; kept?: number; sky?: SkyReport | null };
+type BlockReport = {
+  frames: number;
+  train_frames: number;
+  eval?: { psnr: number } | null;
+  kept?: number;
+  sky?: SkyReport | null;
+  /** Taken from an earlier version (v`from`): the new videos left it alone. */
+  reused?: boolean;
+  from?: number;
+};
+/** A version that shows an earlier version's block splats until it trains (worker.runner.inherit_blocks). */
+type Inherited = { quality: TrainQuality; from: number; reused: number; stale: number };
 type FramesReport = {
   keyframes: number;
   full_resolution: number;
@@ -253,8 +264,15 @@ function TrainingReport({ report, skyRemoved }: { report: TrainReport; skyRemove
     .filter((e): e is readonly [string, SkyReport] => e[1] != null);
   const psnrs = blocks.map(([, b]) => b.eval?.psnr).filter((p): p is number => p != null);
   const mean = psnrs.length ? psnrs.reduce((a, b) => a + b, 0) / psnrs.length : null;
+  const reused = blocks.filter(([, b]) => b.reused);
+  const sources = [...new Set(reused.map(([, b]) => b.from))].map((n) => `v${n}`).join(", ");
   return (
     <div className="muted small report">
+      {reused.length > 0 && (
+        <div>
+          {reused.length} of {blocks.length} blocks reused from {sources} (no new frames in them)
+        </div>
+      )}
       {f && (
         <div>
           Frames: {f.keyframes} keyframes{f.full_resolution ? " at full resolution" : ""}
@@ -272,7 +290,7 @@ function TrainingReport({ report, skyRemoved }: { report: TrainReport; skyRemove
         <div>
           Held-out PSNR{mean != null && ` (mean ${mean.toFixed(2)} dB)`}:{" "}
           {blocks
-            .map(([key, b]) => `${key} ${b.eval ? b.eval.psnr.toFixed(2) : "–"} (${b.train_frames} fr${b.kept ? `, ${(b.kept / 1e6).toFixed(1)}M splats` : ""})`)
+            .map(([key, b]) => `${key} ${b.eval ? b.eval.psnr.toFixed(2) : "–"} (${b.reused ? `v${b.from}, ` : ""}${b.train_frames} fr${b.kept ? `, ${(b.kept / 1e6).toFixed(1)}M splats` : ""})`)
             .join(" · ")}
         </div>
       )}
@@ -311,6 +329,7 @@ function VersionRow({
   const busy = v.train_status === "queued" || v.train_status === "training" || v.train_status === "cancelling";
   const train = (quality: TrainQuality) =>
     api.train(slug, v.id, quality).catch((err) => onError((err as Error).message));
+  const inherited = v.metrics.blocks_inherited as Inherited | undefined;
   const took = TRAIN_OPTIONS.map(({ quality }) => [quality, (v.metrics[`splat_${quality}`] as { seconds?: number } | undefined)?.seconds] as const)
     .filter(([, seconds]) => seconds != null)
     .map(([quality, seconds]) => `${quality} took ${formatDuration(seconds!)}`)
@@ -371,11 +390,18 @@ function VersionRow({
           </button>
         </div>
       )}
+      {inherited && (
+        <div className="muted small" title="Blocks the new videos didn't look into keep the earlier splats; the others show the earlier splats until trained (B shows which)">
+          {inherited.reused} of {inherited.reused + inherited.stale} {inherited.quality} blocks reused from v{inherited.from}
+          {inherited.stale > 0 ? `, ${inherited.stale} to train` : ""}
+        </div>
+      )}
       {!busy && (
         <div className="row small">
-          {TRAIN_OPTIONS.filter((o) => !v.splats?.[o.quality]).map((o) => (
+          {TRAIN_OPTIONS.filter((o) => !v.splats?.[o.quality] || inherited?.quality === o.quality).map((o) => (
             <button key={o.quality} onClick={() => train(o.quality)} title={o.title}>
               {o.label}
+              {inherited?.quality === o.quality && ` (${inherited.stale} of ${inherited.reused + inherited.stale} blocks)`}
             </button>
           ))}
           <span className="muted">

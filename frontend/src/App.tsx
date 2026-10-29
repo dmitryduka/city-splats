@@ -4,7 +4,7 @@ import { SceneList } from "./components/SceneList";
 import { ScenePanel } from "./components/ScenePanel";
 import { SplatViewer, type ViewMode } from "./viewer/SplatViewer";
 import type { Geo, MapStyle } from "./viewer/mapTiles";
-import { BLOCK_COLORS, blockOverlays, type BlockOverlay } from "./viewer/blockOverlay";
+import { BLOCK_COLORS, BLOCK_LABELS, blockOverlays, type BlockOverlay } from "./viewer/blockOverlay";
 
 const MODE_KEYS: Record<string, ViewMode> = { "1": "dense", "2": "splats", "3": "points_source", "4": "points_rgb" };
 const MODE_LABELS: Record<ViewMode, string> = {
@@ -325,12 +325,14 @@ export default function App() {
           {showBlocks && blocks.length > 0 && (
             <div className="legend">
               training blocks:
-              {(["done", "training", "queued"] as const).map((s) => (
-                <span key={s}>
-                  <i style={{ background: BLOCK_COLORS[s], borderRadius: 1 }} />
-                  {s === "done" ? "trained" : s} {blocks.filter((b) => b.status === s).length}
-                </span>
-              ))}
+              {(["done", "reused", "training", "queued", "stale"] as const)
+                .filter((s) => s === "done" || blocks.some((b) => b.status === s))
+                .map((s) => (
+                  <span key={s}>
+                    <i style={{ background: BLOCK_COLORS[s], borderRadius: 1 }} />
+                    {BLOCK_LABELS[s]} {blocks.filter((b) => b.status === s).length}
+                  </span>
+                ))}
             </div>
           )}
           {mode === "points_source" && (
