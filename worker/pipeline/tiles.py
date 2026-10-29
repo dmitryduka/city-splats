@@ -190,6 +190,10 @@ def update_tiles(parent: dict | None, spill: Spill, out_dir: Path, root: Path, l
         write_cloud_splats(tile_dir / "splats.ply", xyz, rgb, voxel)
         tiles[key] = {"dir": str(tile_dir.relative_to(root)), "points": len(xyz)}
         futures.append(pool.submit(_build, lod_bin, tile_dir))
+        # Merging takes minutes on big scenes while LoDs build behind it; report as it goes
+        # (the total grows until the last tile is written).
+        if on_progress:
+            on_progress(sum(f.done() for f in futures), len(futures))
 
     def retile(top: str, xyz: np.ndarray, rgb: np.ndarray, target: np.ndarray) -> None:
         """Tiles for points of a top-level cell grouped by leaf (`target`, old points first)."""
