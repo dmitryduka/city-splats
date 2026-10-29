@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { PLYLoader } from "three/examples/jsm/loaders/PLYLoader.js";
 import { dyno, SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
-import { buildMap, type Geo, type MapStyle } from "./mapTiles";
+import { buildMap, type Geo, type MapLayer, type MapStyle } from "./mapTiles";
 import { buildBlocks, type BlockOverlay } from "./blockOverlay";
 
 /** "dense" and "splats" both show the streamed meshes at splatUrl (a dense cloud is streamed
@@ -48,6 +48,8 @@ type Context = {
   points: Partial<Record<PointLayer, THREE.Points>>;
   /** Something visible changed; render on the next animation frame. */
   dirty: boolean;
+  /** The map layer, told where the camera is so it loads tiles there. */
+  map?: MapLayer;
 };
 
 /** Scales every splat by the size uniform at render time, so changing it needs no reload. */
@@ -176,6 +178,7 @@ export function SplatViewer({
       if (moved || ctx.dirty) {
         ctx.dirty = false;
         lastPose.copy(camera.matrixWorld);
+        ctx.map?.follow(camera.position);
         renderer.render(scene, camera);
         frames++;
       }
@@ -265,8 +268,10 @@ export function SplatViewer({
     if (!ctx || !geo || !mapStyle) return;
     const map = buildMap(geo, mapStyle, () => (ctx.dirty = true), (a, failed) => onMapSourceRef.current?.(a, failed));
     ctx.world.add(map.group);
+    ctx.map = map;
     ctx.dirty = true;
     return () => {
+      if (ctx.map === map) ctx.map = undefined;
       map.dispose();
       ctx.dirty = true;
     };
