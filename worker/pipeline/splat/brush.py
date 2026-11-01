@@ -57,9 +57,11 @@ class BrushTrainer:
         freeze_scales: bool = False,
         eval_names: list[str] | None = None,
         on_step: Callable[[int, int], None] | None = None,
+        start_step: int = 0,
     ) -> Path:
         """Trains and returns the final export. Frames in `eval_names` are held out and
-        evaluated on (eval_results); otherwise every 8th frame by name."""
+        evaluated on (eval_results); otherwise every 8th frame by name. `start_step`: steps
+        `init_ply` (an export of this training) already had; it trains on from there."""
         # Brush wants a COLMAP dataset dir: images/, sparse/0/, and optionally a .ply that
         # it uses as initialization (warm start from the previous version's splat).
         dataset = work_dir / "dataset"
@@ -93,6 +95,8 @@ class BrushTrainer:
             "--max-resolution", str(max_resolution),
             "--sh-degree", str(sh_degree),
         ]
+        if start_step:
+            cmd += ["--start-iter", str(start_step)]
         if freeze_scales:
             cmd.append("--freeze-scales")
         if eval_names is not None:

@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 
+from worker.pipeline import gpu_features
 from worker.pipeline.devices.dji import geo_offset
 from worker.pipeline.features import FeatureConfig
 from worker.reporting import StepReporter, step
@@ -61,6 +62,9 @@ class Piece:
     scene_from_piece: pycolmap.Sim3d = field(default_factory=pycolmap.Sim3d)
     contribution_id: int | None = None
     gps: Path | None = None  # per-frame GPS positions (worker.prefetch writes gps.json), if any
+    # Its track fixes the scene's map frame (georeference); not when the track only placed it
+    # (no view in common with the scene): its heights are above its own takeoff, kilometres off.
+    georef: bool = True
 
     def to_json(self, root: Path) -> dict:
         relative = lambda path: path.resolve().relative_to(root.resolve()).as_posix()  # noqa: E731
@@ -70,13 +74,14 @@ class Piece:
             "scene_from_piece": sim3_to_json(self.scene_from_piece),
             "contribution_id": self.contribution_id,
             "gps": relative(self.gps) if self.gps else None,
+            **({} if self.georef else {"georef": False}),
         }
 
     @classmethod
     def from_json(cls, data: dict, root: Path) -> Piece:
         return cls(root / data["reconstruction"], root / data["database"],
                    sim3_from_json(data["scene_from_piece"]), data.get("contribution_id"),
-                   root / data["gps"] if data.get("gps") else None)
+                   root / data["gps"] if data.get("gps") else None, data.get("georef", True))
 
     def positions(self) -> tuple[tuple[float, float], dict[str, np.ndarray]] | None:
         """(origin lat/lon, frame name -> metres east/north of it), or None without GPS."""
@@ -205,7 +210,13 @@ def link_piece(
     imported.match_list_path = str(pair_file)
     imported.block_size = 50  # COLMAP logs progress per block (default 1225 pairs)
     num_pairs = sum(len(cs) for cs in pairs.values())
-    with step(report, "match_retrieval", num_pairs):
+    with step(report, "match_retrieval", num_pairs) as tick:
+        if features.name == "aliked" and gpu_features.available():
+            # LightGlue on the GPU (COLMAP's ONNX one runs on the CPU on a Mac); COLMAP then
+            # only verifies the stored matches. On 100 ride link pairs the same matches
+            # (56487 vs 56396; 91 pairs identical, the rest under 15 matches either way).
+            gpu_features.match_lightglue(link_db, pair_file, features.cross_matching.aliked.lightglue.min_score,
+                                         tick)
         pycolmap.match_image_pairs(link_db, matching_options=features.cross_matching, pairing_options=imported,
                                    device=features.device)
     timings["match_retrieval"] = time.time() - t

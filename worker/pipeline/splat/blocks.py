@@ -206,11 +206,22 @@ def plan_blocks(rec: pycolmap.Reconstruction, geo: dict, budget: int, min_side_m
     return blocks
 
 
-def block_plan(blocks: list[Block]) -> list[dict]:
+def block_plan(blocks: list[Block], rec: pycolmap.Reconstruction, geo: dict) -> list[dict]:
     """Blocks as stored in Version.metrics["block_plan"]: cells in the map frame (metres
-    east/north, the frame of geo["scene_from_map"]), in training order."""
-    return [{"key": b.key, "cells": [[round(c, 2) for c in cell] for cell in b.cells], "grow": round(b.grow, 1),
-             "frames": len(b.core)} for b in blocks]
+    east/north, the frame of geo["scene_from_map"]), in training order, and the area its
+    frames' cameras span (the overlay clips its cells, which can reach kilometres, to that:
+    geo's extent covers only GPS-tagged frames, not a video placed by anchors)."""
+    centres = {im.name: im.projection_center() for im in rec.images.values() if im.has_pose}
+    plan = []
+    for b in blocks:
+        entry = {"key": b.key, "cells": [[round(c, 2) for c in cell] for cell in b.cells], "grow": round(b.grow, 1),
+                 "frames": len(b.core)}
+        xyz = [centres[n] for n in b.core if n in centres]
+        if xyz:
+            xy = _to_map(np.array(xyz), map_from_scene(geo))[:, :2]
+            entry["area"] = [round(float(c), 1) for c in (*xy.min(0), *xy.max(0))]
+        plan.append(entry)
+    return plan
 
 
 def block_model(rec: pycolmap.Reconstruction, geo: dict, block: Block) -> pycolmap.Reconstruction:

@@ -48,7 +48,18 @@ TRAIN_BLOCK_FRAMES = int(os.environ.get("TRAIN_BLOCK_FRAMES", 500))
 # - TRAIN_EXTRA_FRAMES: extra frames per gap between keyframes, posed from the neighbouring
 #   keyframes' SfM points (optical flow + PnP). Extra frames always use shared cameras.
 # - TRAIN_DENSE_INIT: points per block from the dense cloud as Brush's start (with the SfM
-#   points), instead of the SfM points alone.
+#   points), instead of the SfM points alone. Not for blocks mostly of rig (Insta360) frames:
+#   the street ride's depth fits are 3x worse than the drone's (median 6.2% vs 2.3%), so its
+#   dense cloud smears objects along the camera rays, and 5000 steps left those lines of
+#   evenly sized splats standing (Achapnyak Ultra v9, block 4_11_6).
+# Blocks mostly of rig (Insta360) frames, both set per scene:
+# - TRAIN_RIG_STEPS: their steps (0: the quality's), so a scene's rides and drone footage can
+#   train to different counts (Yerevan: drone blocks 7000; the ride's, trained to 5000 in a
+#   scene of their own, on to more).
+# - TRAIN_RIG_EXTRA_FRAMES: extra moments per gap between a rig video's keyframes, rendered into
+#   every view and posed like TRAIN_EXTRA_FRAMES (worker.pipeline.splat.frames).
+TRAIN_RIG_STEPS = int(os.environ.get("TRAIN_RIG_STEPS", 0))
+TRAIN_RIG_EXTRA_FRAMES = int(os.environ.get("TRAIN_RIG_EXTRA_FRAMES", 0))
 TRAIN_SHARED_CAMERAS = int(os.environ.get("TRAIN_SHARED_CAMERAS", 0))
 TRAIN_FRAME_SIDE = int(os.environ.get("TRAIN_FRAME_SIDE", 0))
 TRAIN_EXTRA_FRAMES = int(os.environ.get("TRAIN_EXTRA_FRAMES", 0))
@@ -58,6 +69,11 @@ TRAIN_DENSE_INIT = int(os.environ.get("TRAIN_DENSE_INIT", 0))
 # then renders empty. Every 4th view of Achapnyak Ultra's first block (447 of 1786) still saw
 # each splat 68 times (median); masks took 1.6 s/frame on the M3's CPU. 0 keeps the sky.
 TRAIN_SKY_EVERY = int(os.environ.get("TRAIN_SKY_EVERY", 4))
+# Blocks mostly of rig (Insta360) views drop instead the splats on sky, in every view, in at
+# least RIG_SKY_HITS views: from the street, the sky fog lands on sky in the upward views but on
+# buildings in the side ones, and most-views voting removed 0.1% of the first ride clip's splats
+# (2 hits: 3.0%, all of the fog, façades kept; worker.pipeline.sky).
+RIG_SKY_HITS = int(os.environ.get("RIG_SKY_HITS", 2))
 # A version's blocks are those of its nearest block-trained ancestor plus new ones where its
 # videos looked outside them (worker.pipeline.splat.blocks); an ancestor block is trained again
 # only if TRAIN_STALE_FRAMES new frames look into it, or its margin gained new frames beyond
@@ -67,6 +83,11 @@ TRAIN_SKY_EVERY = int(os.environ.get("TRAIN_SKY_EVERY", 4))
 # (nor into their margins); 10 frames ignores a video that only glimpses a block.
 TRAIN_STALE_FRAMES = int(os.environ.get("TRAIN_STALE_FRAMES", 10))
 TRAIN_STALE_MARGIN = float(os.environ.get("TRAIN_STALE_MARGIN", 0.1))
+# A block trained with fewer steps than now asked for (e.g. 5000 first, to see a large scene
+# sooner) trains on from its last export (resume.ply) to the new count, if nothing else about
+# it changed; one trained with more steps is kept as it is.
+# Video prefixes (comma-separated, e.g. "c35") whose blocks train first: a scene setting.
+TRAIN_BLOCKS_FIRST = os.environ.get("TRAIN_BLOCKS_FIRST", "")
 UNIFORM_INIT_POINTS = int(os.environ.get("UNIFORM_INIT_POINTS", 500_000))
 AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "none")
 TRAIN_PREVIEW_EVERY = int(os.environ.get("TRAIN_PREVIEW_EVERY", 1000))
@@ -93,6 +114,12 @@ LOD_JOBS = int(os.environ.get("LOD_JOBS", os.cpu_count() or 4))
 # as one), and depth prediction one video at a time on the GPU.
 INGEST_VIDEOS = int(os.environ.get("INGEST_VIDEOS", 3))
 DECODE_THREADS = int(os.environ.get("DECODE_THREADS", 4))
+# Keyframes of rig videos (Insta360 rides) at most RIG_KEYFRAME_INTERVAL s apart, the sharpest
+# of each slot, none dropped for blur. Motion (median optical flow of the fisheye) barely
+# tells riding from standing on a bike (0.06-0.09 vs 0.03 of the width per second: the rider
+# and the bike fill the view), so the default motion spacing put keyframes 0.67 s apart
+# (up to 3.7 s) and tracking broke in fast turns where neighbours shared 46 inliers.
+RIG_KEYFRAME_INTERVAL = float(os.environ.get("RIG_KEYFRAME_INTERVAL", 0.33))
 # Videos whose own SfM model is built at once, splitting the cores. On the M3 (4 performance +
 # 4 efficiency cores) two at 4 threads each were far slower than one after the other at 8: a
 # global mapping attempt went from ~3 min to ~21 min. So more than one only on bigger CPUs.

@@ -14,6 +14,15 @@ between the roofs and flight height. Two rules, measured on Achapnyak Ultra's fi
   of the opacity x area, and the sky renders empty. It also trims the far skyline beyond the
   reconstructed area (blurry there anyway); capping only where there are SfM points kept
   that, but left sky blobs over it.
+
+From the street (an Insta360 ride, sky masked out of training) the vote barely works: the sky
+there is a fog of splats at roof height that land on sky in the upward views but on the
+buildings behind them in the side views, so few are on sky in most views (0.1% of the 30 s
+ride's 1.3M splats). There, a splat is sky if it lands on sky, eroded by ERODE of the width,
+in at least `hits` views: a real surface would have hidden the sky in each of them, and the
+erosion keeps roof edges and walls off it. With 2 hits the ride's held-out renders lose all
+of the fog (3.0% of the splats) and keep the façades, a tall building's top included; the
+roof cap then takes another 104 splats, a few cloud blobs.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pycolmap
 from PIL import Image
@@ -57,6 +67,7 @@ def predict_sky(image_root: Path, names: list[str], out_dir: Path, device: str |
 
 
 CAP_MARGIN_M = 10.0
+ERODE = 0.01
 
 
 @dataclass
@@ -104,10 +115,11 @@ def _above_roofs(xyz: np.ndarray, rec: pycolmap.Reconstruction, geo: dict, margi
 
 
 def clean_sky(splat_ply: Path, rec: pycolmap.Reconstruction, geo: dict, names: list[str], mask_dir: Path,
-              out_ply: Path, threshold: float = 0.5, min_views: int = 2) -> SkyStats:
+              out_ply: Path, threshold: float = 0.5, min_views: int = 2, hits: int = 0) -> SkyStats:
     """Write splat_ply minus the splats whose centre lands on sky in at least `threshold` of
-    the views (named, with masks in mask_dir) that see it, if at least min_views do, and the
-    ones above the roofs (map frame of geo, worker.pipeline.georef)."""
+    the views (named, with masks in mask_dir) that see it, if at least min_views do (with
+    `hits`: on eroded sky in at least that many views), and the ones above the roofs (map
+    frame of geo, worker.pipeline.georef)."""
     header, props, rows = read_ply(splat_ply)
     xyz = rows[:, [props.index("x"), props.index("y"), props.index("z")]].astype(np.float64)
     seen = np.zeros(len(rows), np.uint16)
@@ -115,6 +127,9 @@ def clean_sky(splat_ply: Path, rec: pycolmap.Reconstruction, geo: dict, names: l
     by_name = {image.name: image for image in rec.images.values()}
     for name in names:
         mask = np.asarray(Image.open(mask_dir / f"{name}.png")) > 127
+        if hits:
+            k = 2 * max(1, int(ERODE * mask.shape[1])) + 1
+            mask = cv2.erode(mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0
         image = by_name[name]
         camera = rec.cameras[image.camera_id]
         pose = image.cam_from_world()
@@ -130,23 +145,24 @@ def clean_sky(splat_ply: Path, rec: pycolmap.Reconstruction, geo: dict, names: l
         idx = front[inside]
         seen[idx] += 1
         sky[idx] += mask[v[inside], u[inside]]
-    voted = (seen >= min_views) & (sky >= threshold * seen)
+    voted = (sky >= hits) if hits else (seen >= min_views) & (sky >= threshold * seen)
     above = _above_roofs(xyz, rec, geo, CAP_MARGIN_M)
     write_ply(out_ply, header, rows[~(voted | above)])
     return SkyStats(len(rows), len(names), int(voted.sum()), int((above & ~voted).sum()))
 
 
 def remove_sky(block_dir: Path, rec: pycolmap.Reconstruction, geo: dict, image_root: Path, mask_dir: Path,
-               every: int, device: str | None = None, keep_original: bool = False) -> dict:
+               every: int, device: str | None = None, keep_original: bool = False, hits: int = 0) -> dict:
     """Sky splats out of a trained block's splat.ply (in place; with keep_original the
-    input stays as splat_with_sky.ply), voting over every `every`th of its views. rec (the
-    block's model) loses its unreliable SfM points (clean_sparse)."""
+    input stays as splat_with_sky.ply), voting over every `every`th of its views (with
+    `hits`, see clean_sky). rec (the block's model) loses its unreliable SfM points
+    (clean_sparse)."""
     clean_sparse(rec)  # stray high points would lift the roofs
     names = sky_views(rec, every)
     predict_sky(image_root, names, mask_dir, device)
     splat = block_dir / "splat.ply"
     out = block_dir / "splat_no_sky.ply"
-    stats = clean_sky(splat, rec, geo, names, mask_dir, out)
+    stats = clean_sky(splat, rec, geo, names, mask_dir, out, hits=hits)
     if keep_original:
         splat.rename(block_dir / "splat_with_sky.ply")
     out.replace(splat)

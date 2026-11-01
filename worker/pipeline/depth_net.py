@@ -29,13 +29,17 @@ def main() -> None:
     model = AutoModelForDepthEstimation.from_pretrained(model_id).to(device).eval()
     started = time.time()
     for k, name in enumerate(names):
-        image = Image.open(image_root / name).convert("RGB")
-        inputs = processor(images=image, return_tensors="pt").to(device)
-        with torch.no_grad():
-            disparity = model(**inputs).predicted_depth[0]
         out = out_dir / f"{name}.npy"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        np.save(out, disparity.float().cpu().numpy().astype(np.float16))
+        if not out.exists():  # kept from an interrupted run
+            image = Image.open(image_root / name).convert("RGB")
+            inputs = processor(images=image, return_tensors="pt").to(device)
+            with torch.no_grad():
+                disparity = model(**inputs).predicted_depth[0]
+            out.parent.mkdir(parents=True, exist_ok=True)
+            partial = out.with_name(out.name + ".part")
+            with open(partial, "wb") as f:  # renamed when complete: a killed run leaves no torn file
+                np.save(f, disparity.float().cpu().numpy().astype(np.float16))
+            partial.rename(out)
         # Progress line parsed by the caller.
         print(f"depth {k + 1}/{len(names)}", flush=True)
     print(f"done {len(names)} frames in {time.time() - started:.1f}s on {device}", flush=True)

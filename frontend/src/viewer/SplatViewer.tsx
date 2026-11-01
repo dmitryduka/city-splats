@@ -4,6 +4,7 @@ import { PLYLoader } from "three/examples/jsm/loaders/PLYLoader.js";
 import { dyno, SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import { buildMap, type Geo, type MapLayer, type MapStyle } from "./mapTiles";
 import { buildBlocks, type BlockOverlay } from "./blockOverlay";
+import type { CameraReplay } from "./cameraPath";
 
 /** "dense" and "splats" both show the streamed meshes at splatUrl (a dense cloud is streamed
  * as small splats); the points modes show the sparse PLY layers instead. */
@@ -35,6 +36,10 @@ type Props = {
   onMapSource?: (attribution: string, failed: boolean) => void;
   /** Splat training blocks drawn on the map plane (needs geo; null: hidden). */
   blocks?: BlockOverlay[] | null;
+  /** A video's camera path to fly along; the user's controls are off while it is set. */
+  replay?: CameraReplay | null;
+  /** The replay reached the end of its path (the camera stays there). */
+  onReplayEnd?: () => void;
 };
 
 type PointLayer = "points_source" | "points_rgb" | "cameras";
@@ -105,6 +110,8 @@ export function SplatViewer({
   mapStyle = null,
   onMapSource,
   blocks = null,
+  replay = null,
+  onReplayEnd,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const ctxRef = useRef<Context | null>(null);
@@ -118,6 +125,9 @@ export function SplatViewer({
   opacityRef.current = splatOpacity;
   const onMapSourceRef = useRef(onMapSource);
   onMapSourceRef.current = onMapSource;
+  const replayRef = useRef(replay);
+  const onReplayEndRef = useRef(onReplayEnd);
+  onReplayEndRef.current = onReplayEnd;
 
   const applyVisibility = () => {
     const ctx = ctxRef.current;
@@ -141,6 +151,12 @@ export function SplatViewer({
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x111318);
     const camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.01, 1000);
+    // ?cam=x,y,z,tx,ty,tz: a starting pose (scene coordinates, three.js axes), for screenshots.
+    const pose = new URLSearchParams(window.location.search).get("cam")?.split(",").map(Number);
+    if (pose?.length === 6 && pose.every(Number.isFinite)) {
+      camera.position.set(pose[0], pose[1], pose[2]);
+      camera.lookAt(pose[3], pose[4], pose[5]);
+    }
 
     const ctx: Context = {
       world: new THREE.Group(),
@@ -149,7 +165,11 @@ export function SplatViewer({
       points: {},
       dirty: true,
     };
-    scene.add(new SparkRenderer({ renderer, lodSplatScale, onDirty: () => (ctx.dirty = true) }));
+    // Paged (LoD) splats keep 32-bit centres: by default Spark packs them as 16-bit floats,
+    // which far from the origin snapped Yerevan's ride (~350 units out) onto a ~0.25-unit
+    // (~3 m) grid, its points standing in vertical columns. Twice the page memory.
+    scene.add(new SparkRenderer({ renderer, lodSplatScale, pagedExtSplats: true,
+                                  onDirty: () => (ctx.dirty = true) }));
 
     // Reconstructions live in the COLMAP/OpenCV frame (y down, z forward); flip into
     // three.js (y up, z backward) once at the root.
@@ -171,8 +191,44 @@ export function SplatViewer({
     let frames = 0;
     let last = performance.now();
     const lastPose = new THREE.Matrix4();
+    const replayPosition = new THREE.Vector3();
+    const replayQuaternion = new THREE.Quaternion();
+    let replayTick = 0;
+    let replayEnded: CameraReplay | null = null;
+    // The user's field of view while a replay shows the footage's; restored when it stops.
+    let userFov: number | null = null;
     renderer.setAnimationLoop(() => {
-      controls.update(camera);
+      const replay = replayRef.current;
+      if (replay) {
+        // The path is in the reconstruction's frame, like the layers: place it through the
+        // same root transform (the COLMAP -> three.js flip).
+        const now = performance.now();
+        const playing = replay.step(replayTick ? (now - replayTick) / 1000 : 0);
+        replayTick = now;
+        replay.pose(replayPosition, replayQuaternion);
+        if (replay.fov && camera.fov !== replay.fov) {
+          userFov ??= camera.fov;
+          camera.fov = replay.fov;
+          camera.updateProjectionMatrix();
+          ctx.dirty = true;
+        }
+        ctx.world.updateWorldMatrix(true, false);
+        camera.position.copy(ctx.world.localToWorld(replayPosition));
+        camera.quaternion.copy(ctx.world.quaternion).multiply(replayQuaternion);
+        if (!playing && replayEnded !== replay) {
+          replayEnded = replay;
+          onReplayEndRef.current?.();
+        }
+      } else {
+        replayTick = 0;
+        if (userFov !== null) {
+          camera.fov = userFov;
+          camera.updateProjectionMatrix();
+          userFov = null;
+          ctx.dirty = true;
+        }
+        controls.update(camera);
+      }
       camera.updateMatrixWorld();
       const moved = !camera.matrixWorld.equals(lastPose);
       if (moved || ctx.dirty) {
@@ -301,6 +357,17 @@ export function SplatViewer({
   useEffect(() => {
     if (controlsRef.current) controlsRef.current.fpsMovement.moveSpeed = moveSpeed;
   }, [moveSpeed]);
+
+  useEffect(() => {
+    replayRef.current = replay;
+    const controls = controlsRef.current;
+    if (replay || !controls) return;
+    // Hand control back from where the replay left the camera: no catch-up time step and no
+    // drag inertia left over from before or during the replay.
+    controls.lastTime = 0;
+    controls.pointerControls.rotateVelocity.set(0, 0, 0);
+    controls.pointerControls.moveVelocity.set(0, 0, 0);
+  }, [replay]);
 
   useEffect(() => {
     const ctx = ctxRef.current;

@@ -282,7 +282,7 @@ class Progress:
 
         try:
             with ColmapProgress(on_progress, total_hint=total, on_phase=on_phase, source=log_source(name)):
-                yield
+                yield on_progress  # for steps that count their own work (not COLMAP's log)
         finally:
             with self._lock:
                 sub.actual = sub.elapsed

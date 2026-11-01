@@ -81,7 +81,7 @@ index 7d6a769..15a0308 100644
              max_scene_batch_cache_size: 0,
          };
 diff --git a/crates/brush-process/src/train_stream.rs b/crates/brush-process/src/train_stream.rs
-index abf9c0a..1d3b7c3 100644
+index abf9c0a..536b072 100644
 --- a/crates/brush-process/src/train_stream.rs
 +++ b/crates/brush-process/src/train_stream.rs
 @@ -135,6 +135,10 @@ pub(crate) async fn train_stream(
@@ -95,6 +95,14 @@ index abf9c0a..1d3b7c3 100644
  
      // If the metadata has an up axis prefer that, otherwise estimate the up direction.
      let up_axis = up_axis.or(Some(estimated_up));
+@@ -185,6 +189,7 @@ pub(crate) async fn train_stream(
+         process_config.seed,
+     );
+     trainer.set_view_cams(view_cams.clone());
++    trainer.set_start_iter(process_config.start_iter);
+ 
+     // Get the dataset name from the base path (if available) for interpolation.
+     let dataset_name = vfs
 diff --git a/crates/brush-render/src/gaussian_splats.rs b/crates/brush-render/src/gaussian_splats.rs
 index 6a6b70d..6bcd640 100644
 --- a/crates/brush-render/src/gaussian_splats.rs
@@ -149,10 +157,19 @@ index 9c1155a..3a4e293 100644
          self.total_train_iters + self.lod_levels * self.lod_refine_steps
      }
 diff --git a/crates/brush-train/src/train.rs b/crates/brush-train/src/train.rs
-index b46d080..70a11af 100644
+index b46d080..7f9ba39 100644
 --- a/crates/brush-train/src/train.rs
 +++ b/crates/brush-train/src/train.rs
-@@ -159,6 +159,13 @@ impl SplatTrainer {
+@@ -81,6 +81,8 @@ pub struct SplatTrainer {
+     ssim_enabled: bool,
+     bounds: BoundingBox,
+     step_count: u32,
++    /// Steps already trained before this run (--start-iter): the mean-LR schedule continues from there.
++    start_iter: u32,
+     max_sh_degree: u32,
+     rng: rand::rngs::StdRng,
+     /// Per-train-view (world center, focal in px at native res) for the
+@@ -159,6 +161,13 @@ impl SplatTrainer {
  
          // Optimizer state lives on the inner device.
          let opt_device = device.clone().inner();
@@ -166,7 +183,7 @@ index b46d080..70a11af 100644
          let (rot, scale) = (config.lr_rotation as f32, config.lr_scale as f32);
          let lr_scaling_fixed = Tensor::<1>::from_floats(
              [0.0, 0.0, 0.0, rot, rot, rot, rot, scale, scale, scale],
-@@ -175,7 +182,6 @@ impl SplatTrainer {
+@@ -175,7 +184,6 @@ impl SplatTrainer {
          // total_train_iters but their refines should never grow — clamp
          // here so growth_stop is never effectively past end-of-training,
          // and growth_start never past growth_stop.
@@ -174,7 +191,36 @@ index b46d080..70a11af 100644
          config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
          config.growth_start_iter = config.growth_start_iter.min(config.growth_stop_iter);
  
-@@ -727,7 +733,12 @@ impl SplatTrainer {
+@@ -192,6 +200,7 @@ impl SplatTrainer {
+             ssim_enabled,
+             bounds,
+             step_count: 0,
++            start_iter: 0,
+             max_sh_degree: 0,
+             rng: rand::rngs::StdRng::seed_from_u64(seed),
+             view_cams: Vec::new(),
+@@ -211,6 +220,11 @@ impl SplatTrainer {
+         self.view_cams = view_cams;
+     }
+ 
++    /// Resume the learning-rate schedule at `iter` (training continued from an export).
++    pub fn set_start_iter(&mut self, iter: u32) {
++        self.start_iter = iter;
++    }
++
+     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
+         let mut splats = splats;
+ 
+@@ -246,7 +260,7 @@ impl SplatTrainer {
+         let median_scale = self.bounds.median_size();
+ 
+         let lr_mean = self.config.lr_mean
+-            * self.lr_mean_decay.powi(self.step_count as i32 - 1)
++            * self.lr_mean_decay.powi((self.start_iter + self.step_count) as i32 - 1)
+             * median_scale as f64;
+         let masked_alpha = batch.alpha_mode == AlphaMode::Masked;
+         let do_alpha_match = has_alpha && !masked_alpha && self.config.match_alpha_weight > 0.0;
+@@ -727,7 +741,12 @@ impl SplatTrainer {
                  .sqrt();
              let offset_local = offset_factor * cur_scales;
              let samples = quaternion_vec_multiply(cur_rots.clone(), offset_local);

@@ -18,6 +18,8 @@ export type BlockOverlay = {
   /** The map frame the cells are in (scene_from_map) when it is an earlier version's: blocks
    * keep the frame of the version they were first trained in. */
   frame?: number[][] | null;
+  /** The ground its frames' cameras span ([minE, minN, maxE, maxN]); older plans lack it. */
+  area?: [number, number, number, number] | null;
 };
 
 export const BLOCK_COLORS: Record<BlockOverlay["status"], string> = {
@@ -36,8 +38,8 @@ export const BLOCK_LABELS: Record<BlockOverlay["status"], string> = {
   stale: "to train",
 };
 
-/** Cells are clipped to the flight plus this margin: blocks own all ground nearest to them,
- * so a block's cells can reach kilometres past where any frame looked. */
+/** Cells are clipped to the block's cameras (or the GPS flight) plus this margin: blocks own
+ * all ground nearest to them, so a block's cells can reach kilometres past where any frame looked. */
 const MARGIN = 120;
 /** Just above the map (z = 0), which lies half a metre under the fitted ground. */
 const LIFT = 0.1;
@@ -113,8 +115,7 @@ export function buildBlocks(geo: Geo, blocks: BlockOverlay[]): BlockLayer {
   group.matrixAutoUpdate = false;
   const frame = blocks.find((b) => b.frame)?.frame ?? geo.scene_from_map;
   group.matrix.set(...(frame.flat() as Parameters<THREE.Matrix4["set"]>));
-  const [minE, minN, maxE, maxN] = geo.extent;
-  const area: Rect = [minE - MARGIN, minN - MARGIN, maxE + MARGIN, maxN + MARGIN];
+  const around = ([minE, minN, maxE, maxN]: Rect): Rect => [minE - MARGIN, minN - MARGIN, maxE + MARGIN, maxN + MARGIN];
   const disposables: { dispose: () => void }[] = [];
   // Labels keep a fixed share of the screen height; the group's scale (scene units per metre)
   // would otherwise shrink them with it.
@@ -122,6 +123,8 @@ export function buildBlocks(geo: Geo, blocks: BlockOverlay[]): BlockLayer {
   const labelHeight = LABEL_HEIGHT / metre;
 
   for (const block of blocks) {
+    // geo.extent covers only GPS-tagged frames; a video placed by anchors lies outside it.
+    const area = around(block.area ?? geo.extent);
     const cells = block.cells.map((c) => clip(c, area)).filter((c): c is Rect => c !== null);
     if (!cells.length) continue;
     const color = new THREE.Color(BLOCK_COLORS[block.status]);
@@ -179,7 +182,8 @@ export function buildBlocks(geo: Geo, blocks: BlockOverlay[]): BlockLayer {
 }
 
 type BlockResult = { cells?: Rect[]; eval?: { psnr?: number } | null; reused?: boolean; from?: number };
-type PlannedBlock = { key: string; cells: Rect[]; status?: "reused" | "stale"; from?: number; reason?: string };
+type PlannedBlock = { key: string; cells: Rect[]; status?: "reused" | "stale"; from?: number; reason?: string;
+  area?: Rect };
 
 /** A version's blocks with their status, from its metrics: the plan stored when training
  * started (or when the version took over an earlier version's blocks: which are reused and
@@ -207,6 +211,6 @@ export function blockOverlays(metrics: Record<string, unknown>, training: boolea
       status = entry.status; // not trained in this version yet
     }
     return { key, cells, status, index: i + 1, count: plan.length, psnr: result?.eval?.psnr ?? null,
-      from: result?.from ?? entry?.from ?? null, reason: entry?.reason ?? null, frame };
+      from: result?.from ?? entry?.from ?? null, reason: entry?.reason ?? null, frame, area: entry?.area ?? null };
   });
 }

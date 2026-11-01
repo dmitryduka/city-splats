@@ -108,3 +108,12 @@ button.link { background: none; border: none; padding: 2px 0; color: var(--accen
 
 .map-note { font-size: 11px; color: var(--muted); }
 .map-note.error { color: #f0a050; }
+
+.contribution button.replay { padding: 1px 8px; font-size: 12px; }
+.replay-bar { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex;
+  align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; background: rgba(0, 0, 0, .65);
+  font: 12px/1.6 ui-monospace, monospace; max-width: calc(100% - 32px); }
+.replay-bar .replay-label { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.replay-bar input { width: 220px; }
+.replay-bar .replay-time { white-space: nowrap; }
+.replay-bar .surface-switch { margin: 0; }

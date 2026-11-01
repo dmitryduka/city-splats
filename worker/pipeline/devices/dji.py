@@ -10,6 +10,14 @@ So the vertical is precise, the horizontal coarse; D tightens it: home is fitted
 (position, D) pairs, then each smoothed position is moved along its bearing from home to its
 exact distance D. That leaves the bearing error (a few metres at tens of metres from home).
 
+A Mini 3 writes a cue per frame (60 a second), in a sidecar .SRT unless the video has it as a
+track (embed_srt), with the position to 1e-6 degree (~0.1 m; the fix itself updates ~10 times a
+second) and no D:
+
+    [latitude: 40.195194] [longitude: 44.509694] [rel_alt: 57.300 abs_alt: 1076.050]
+
+Its cues are averaged per second and used as they are.
+
 Enough to keep a reconstruction's scale consistent along the flight: hovering and pure
 gimbal turns leave image-only SfM free to solve parts of a flight at different scales.
 """
@@ -29,6 +37,8 @@ _CUE_TIME = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->")
 _GPS = re.compile(r"GPS \(([-\d.]+),\s*([-\d.]+)")
 _HEIGHT = re.compile(r"\bH ([-\d.]+)m")
 _DISTANCE = re.compile(r"\bD ([-\d.]+)m")
+_LATLON = re.compile(r"latitude: ([-\d.]+)\]\s*\[longitude: ([-\d.]+)")
+_REL_ALT = re.compile(r"rel_alt: ([-\d.]+)")
 
 
 @dataclass
@@ -47,30 +57,54 @@ class Track:
 
 
 def _cues(video: Path) -> list[tuple[float, str]]:
+    """(start, text) of the telemetry cues: the video's subtitle track, else a sidecar .SRT."""
     out = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(video), "-map", "0:s:0", "-f", "srt", "-"],
         capture_output=True, text=True,
     ).stdout
+    if not out:
+        sidecar = next((p for p in (video.with_suffix(".SRT"), video.with_suffix(".srt")) if p.exists()), None)
+        out = sidecar.read_text(errors="replace") if sidecar else ""
     cues, start = [], None
     for line in out.splitlines():
         if match := _CUE_TIME.search(line):
             h, m, s, ms = (int(x) for x in match.groups())
             start = h * 3600 + m * 60 + s + ms / 1000
-        elif start is not None and "GPS (" in line:
+        elif start is not None and ("GPS (" in line or "latitude:" in line):
             cues.append((start, line))
             start = None
     return cues
 
 
+def embed_srt(video: Path, srt: Path, out: Path) -> None:
+    """The video with a sidecar .SRT as its subtitle track (a lossless remux), so it uploads as
+    one file."""
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-i", str(srt), "-map", "0", "-map", "1",
+                    "-c", "copy", "-c:s", "mov_text", "-tag:v", "hvc1" if _codec(video) == "hevc" else "avc1",
+                    "-metadata:s:s:0", "handler_name=DJI.Subtitle", str(out)], check=True)
+
+
+def _codec(video: Path) -> str:
+    return subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+                           "-of", "csv=p=0", str(video)], capture_output=True, text=True).stdout.strip()
+
+
 def read_track(video: Path, smooth_seconds: float = 5.0, min_bearing_distance: float = 15.0) -> Track | None:
     """The flight track, or None if the video has no DJI telemetry (or no GPS fix)."""
-    rows = []
+    rows, precise = [], {}
     for start, text in _cues(video):
+        if (latlon := _LATLON.search(text)) and (alt := _REL_ALT.search(text)):
+            lat, lon = float(latlon.group(1)), float(latlon.group(2))
+            if lat or lon:
+                precise.setdefault(int(start), []).append((lat, lon, float(alt.group(1))))
+            continue
         gps, height, distance = _GPS.search(text), _HEIGHT.search(text), _DISTANCE.search(text)
         if gps and height and distance:
             lon, lat = float(gps.group(1)), float(gps.group(2))
             if lat or lon:
                 rows.append((start + 0.5, lat, lon, float(height.group(1)), float(distance.group(1))))
+    if len(precise) >= 10:
+        return _precise_track(precise)
     if len(rows) < 10:
         return None
     t, lat, lon, height, distance = (np.array(c) for c in zip(*rows))
@@ -90,6 +124,17 @@ def read_track(video: Path, smooth_seconds: float = 5.0, min_bearing_distance: f
         offset = xy[far] - home
         xy[far] = home + offset * (distance[far] / np.maximum(np.linalg.norm(offset, axis=1), 1e-6))[:, None]
     return Track(t, np.column_stack([xy, height]), lat0, lon0, sigma=(3.0, 3.0, 0.3))
+
+
+def _precise_track(seconds: dict[int, list[tuple[float, float, float]]]) -> Track:
+    """A per-frame track (Mini 3), averaged per second. Sigma: the GNSS hover accuracy DJI
+    states (1.5 m horizontal; barometric height as for the other format), not measured here."""
+    t = np.array(sorted(seconds), dtype=float)
+    lat, lon, height = (np.array([np.mean([c[k] for c in seconds[int(s)]]) for s in t]) for k in range(3))
+    lat0, lon0 = float(np.median(lat)), float(np.median(lon))
+    x = np.radians(lon - lon0) * _EARTH_RADIUS * np.cos(np.radians(lat0))
+    y = np.radians(lat - lat0) * _EARTH_RADIUS
+    return Track(t + 0.5, np.column_stack([x, y, height]), lat0, lon0, sigma=(1.5, 1.5, 0.3))
 
 
 def geo_offset(origin: tuple[float, float], reference: tuple[float, float]) -> np.ndarray:

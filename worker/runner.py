@@ -3,10 +3,11 @@ publish) and train one version's splat (train -> remove floaters -> LoD)."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import shutil
@@ -31,12 +32,16 @@ from backend.app.config import (
     LINK_RADIUS_M,
     LOD_JOBS,
     MIN_REGISTRATION_RATIO,
+    RIG_SKY_HITS,
     SCENES_ROOT,
     TRAIN_BLOCK_FRAMES,
+    TRAIN_BLOCKS_FIRST,
     TRAIN_DENSE_INIT,
     TRAIN_EXTRA_FRAMES,
     TRAIN_FRAME_SIDE,
     TRAIN_PREVIEW_EVERY,
+    TRAIN_RIG_EXTRA_FRAMES,
+    TRAIN_RIG_STEPS,
     TRAIN_SHARED_CAMERAS,
     TRAIN_SKY_EVERY,
     TRAIN_SETTINGS,
@@ -55,9 +60,11 @@ from worker.pipeline.dense import (
     DenseStats, align_frames, fuse_frames, predict_depth,
 )
 from worker.pipeline.devices import image_names
-from worker.pipeline.devices.insta360 import RIG_FILE, read_rig
+from worker.pipeline.devices.insta360 import RIG_FILE, VIEWS, read_rig
+from worker.pipeline.camera_paths import export_camera_paths
 from worker.pipeline.export import export_layers
-from worker.pipeline.georef import anchor_offsets, georeference, georeference_anchors, scene_from_anchors
+from worker.pipeline.georef import (anchor_offsets, georeference, georeference_anchors, scene_from_anchors,
+                                    scene_from_track, snap_to_points, warp_to_waypoints)
 from worker.pipeline.features import DEFAULT_FEATURES, feature_config
 from worker.pipeline.ingest import probe
 from worker.pipeline.lod import build_lod
@@ -74,6 +81,7 @@ from worker.pipeline.splat.frames import (
     candidates,
     copy_poses,
     decode_images,
+    decode_rig_images,
     plan_images,
     shared_cameras,
 )
@@ -229,6 +237,14 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
         # Hand-given start/end positions (scene settings GPS_ANCHORS, for videos without a GPS
         # track) can place a video the scene has no view in common with.
         anchors = scene_setting(scene.settings, "GPS_ANCHORS", {}).get(c.image_dir_name)
+        if anchors and rejection is None and anchors.get("waypoints"):
+            # Timed positions along the way (e.g. where each of the camera's files ends): the
+            # model is bent through them first, a long ride's scale drifting on its own.
+            warped = warp_to_waypoints(pycolmap.Reconstruction(piece.reconstruction), c.image_dir_name,
+                                       {f["name"]: f["timestamp"] for f in frames}, anchors, work / "warp")
+            if warped is not None:
+                piece.reconstruction = work / "warp" / "warped"
+                metrics["warp"] = {"waypoints": len(anchors["waypoints"])}
         head_geo = head.metrics.get("geo") if head is not None else None
         by_anchors = None
         if head_geo and anchors and rejection is None:
@@ -255,6 +271,15 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
             elif by_anchors is not None:
                 piece.scene_from_piece = by_anchors
                 metrics |= {"strategy": "anchors", "gate": f"placed by GPS anchors ({link.reason})"}
+            elif piece.gps is not None and head_geo:
+                # Its own GPS track places it (a drone over a street ride: the views from 15-60 m
+                # up and from the street matched in 2 frames); then onto the scene's points.
+                piece.scene_from_piece, snap = snap_to_points(
+                    scene_from_track(piece.gps, head_geo), pycolmap.Reconstruction(piece.reconstruction),
+                    pycolmap.Reconstruction(DATA_ROOT / head.reconstruction_path), head_geo)
+                piece.georef = False
+                metrics |= {"strategy": "gps", "snap": snap,
+                            "gate": f"placed by its GPS track ({link.reason})"}
             else:
                 rejection = f"could not place the video in the scene: {link.reason}"
         if rejection:
@@ -270,9 +295,10 @@ def process(contribution_id: int, prefetch: Prefetcher) -> None:
         metrics |= {"points": rec.num_points3D(), "points_before": head.metrics.get("points") if head else None,
                     "pieces": [p.to_json(DATA_ROOT) for p in pieces]}
         export_layers(rec, work / "layers", lambda name: seq_by_dir.get(name.split("/")[0], 1) - 1)
+        export_camera_paths(rec, image_root, work / "layers" / "camera_paths.json")
         # No GPS track (e.g. an Insta360 ride): positions given by hand, per video, in the
         # scene's settings ({"c<id>": {"start": [lat, lon], "end": [lat, lon]}}).
-        if geo := (georeference(rec, [p.gps for p in pieces if p.gps])
+        if geo := (georeference(rec, [p.gps for p in pieces if p.gps and p.georef])
                    or georeference_anchors(rec, scene_setting(scene.settings, "GPS_ANCHORS", {}))):
             metrics["geo"] = geo
         timing.record("layers", len(names), progress.finish())
@@ -491,12 +517,16 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
     (_plan_blocks), so only the stale ones train. Scene settings can add training frames
     (worker.pipeline.splat.frames) and start each block from the dense cloud."""
     settings = _block_settings(scene)
-    bp = _plan_blocks(v, quality, steps, max_resolution, settings, rec)
+    steps_of = _steps_of(v, scene, steps)
+    bp = _plan_blocks(v, quality, steps_of, max_resolution, settings, rec)
+    bp.blocks = _prioritise(bp.blocks, scene)
     geo, blocks = bp.geo, bp.blocks
-    _save_block_plan(v.id, bp)
+    _save_block_plan(v.id, bp, rec)
     stale = [block for block in blocks if block.key in bp.stale]
-    plan = [(block, steps) for block in stale]
-    total = sum(n for _, n in plan) or 1
+    # (block, steps, steps it already has: trained on from its last export, see _plan_blocks)
+    plan = [(block, steps_of(block), bp.resume[block.key]["steps"] if block.key in bp.resume else 0)
+            for block in stale]
+    total = sum(n - start for _, n, start in plan) or 1
     # Held out: every 8th keyframe by name, as one global Brush run would hold out, so block
     # and global splats are measured on the same unseen frames.
     names = sorted(image.name for image in rec.images.values() if image.has_pose)
@@ -530,19 +560,24 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
     _report(v.id, report)
 
     cloud, dense_init = None, settings["dense_init"]
-    if progress.has("init") and stale:
+    # Blocks mostly of rig frames start from their SfM points (see TRAIN_DENSE_INIT).
+    rigs = _rig_prefixes(v)
+    dense_blocks = {block.key for block in stale
+                    if sum(name.split("/")[0] in rigs for name in block.core) <= len(block.core) / 2}
+    fresh = [block for block in stale if block.key not in bp.resume and block.key in dense_blocks]
+    if progress.has("init") and fresh:
         manifest = v.metrics["dense_tiles"]
         progress.start("init", substeps=[("sample", len(manifest["tiles"]))])
         with progress.step("sample", len(manifest["tiles"])):
             # Blocks overlap and differ in density; 4 per block's share leaves each enough.
-            cloud = sample_cloud(manifest, DATA_ROOT, 4 * dense_init * len(stale), on_progress=progress.counts)
+            cloud = sample_cloud(manifest, DATA_ROOT, 4 * dense_init * len(fresh), on_progress=progress.counts)
         progress.finish()
 
     sky_every = settings["sky_every"]
     progress.set_estimate("train", timing.estimate(f"train.{quality}", total))
     progress.start("train")
     done = 0
-    for i, (block, n) in enumerate(plan, start=1):
+    for i, (block, n, start) in enumerate(plan, start=1):
         block_dir = work / block.key
         (block_dir / "model").mkdir(parents=True)
         # What it trains on, for the next version's reuse check (keyframes; extras follow them).
@@ -551,21 +586,25 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
         model = block_model(full, geo, block)
         model.write(block_dir / "model")
         init_ply, init = None, None
-        if cloud is not None:
+        if start:
+            init_ply = DATA_ROOT / bp.resume[block.key]["dir"] / "resume.ply"
+        elif cloud is not None and block.key in dense_blocks:
             progress.update(done / total, detail=f"Block {i}/{len(plan)} · writing its dense start")
             init_ply = block_dir / "init.ply"
             init = block_init(cloud, model, geo, block, dense_init, init_ply)
         snapshots: list[Path] = []
 
-        def on_snapshot(s: Snapshot, block: Block = block, block_dir: Path = block_dir, i: int = i) -> None:
-            progress.update((done + s.step) / total, detail=f"Block {i}/{len(plan)} · step {s.step}/{s.total_steps}")
+        def on_snapshot(s: Snapshot, block: Block = block, block_dir: Path = block_dir, i: int = i,
+                        start: int = start) -> None:
+            progress.update((done + s.step - start) / total,
+                            detail=f"Block {i}/{len(plan)} · step {s.step}/{s.total_steps}")
             if s.step >= s.total_steps:
                 return
             preview_dir = block_dir / f"preview_{s.step}"
             preview_dir.mkdir()
             crop_to_block(s.ply_path, preview_dir / "splat.ply", geo, block, blocks)
             show_preview(list(rads.values()) + [build_lod(BUILD_LOD_BIN, preview_dir / "splat.ply",
-                                                          preview_dir / "lod", quality=False)], done + s.step)
+                                                          preview_dir / "lod", quality=False)], done + s.step - start)
             snapshots.append(preview_dir)
             while len(snapshots) > 2:
                 shutil.rmtree(snapshots.pop(0), ignore_errors=True)
@@ -574,27 +613,36 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
         raw = compute.trainer().train(
             train_root, block_dir / "model", block_dir / "train", n, max_resolution, init_ply, TRAIN_PREVIEW_EVERY,
             on_snapshot, should_stop=lambda: _training_should_stop(v.id), eval_names=eval_names,
-            on_step=lambda step, splats, i=i: progress.update(
-                (done + step) / total, detail=f"Block {i}/{len(plan)} · step {step}/{n} · {splats / 1e6:.1f}M splats"),
+            on_step=lambda step, splats, i=i, start=start: progress.update(
+                (done + step - start) / total,
+                detail=f"Block {i}/{len(plan)} · step {step}/{n} · {splats / 1e6:.1f}M splats"),
+            start_step=start,
         )
-        if init_ply is not None:
+        if init_ply is not None and not start:
             init_ply.unlink()
         kept = crop_to_block(raw, block_dir / "cropped.ply", geo, block, blocks)
+        # The uncropped export, to train on from if more steps are asked for later.
+        shutil.move(raw, block_dir / "resume.ply")
         shutil.rmtree(block_dir / "train" / "exports", ignore_errors=True)
         stats = clean_splats(block_dir / "cropped.ply", block_model(rec, geo, block), block_dir / "splat.ply")
         (block_dir / "cropped.ply").unlink()
         sky = None
         if sky_every:
-            progress.update((done + n) / total, detail=f"Block {i}/{len(plan)} · removing the sky")
-            sky = remove_sky(block_dir, model, geo, train_root, SCENES_ROOT / scene.slug / "sky_masks", sky_every)
+            progress.update((done + n - start) / total, detail=f"Block {i}/{len(plan)} · removing the sky")
+            # Blocks mostly of rig frames: every view, by hits (worker.pipeline.sky); their sky
+            # masks were all made at ingest (worker.pipeline.masks).
+            rig_block = block.key not in dense_blocks
+            sky = remove_sky(block_dir, model, geo, train_root, SCENES_ROOT / scene.slug / "sky_masks",
+                             1 if rig_block else sky_every, hits=RIG_SKY_HITS if rig_block else 0)
         rads[block.key] = build_lod(BUILD_LOD_BIN, block_dir / "splat.ply", block_dir / "lod", quality=True)
-        done += n
+        done += n - start
         evals = eval_results(block_dir / "train")
         results[block.key] = {
             "dir": rel(block_dir), "cells": block.cells, "grow": block.grow, "frames": len(block.core),
             "train_frames": len(set(block.images) & registered) - len(eval_names), "eval_frames": len(eval_names),
             "steps": n, "images_hash": block.images_hash, "eval": evals[-1] if evals else None, "kept": kept,
             "cleanup": stats.as_dict(), "stale": bp.stale[block.key], **({"init": init} if init else {}),
+            **({"resumed": {"from": bp.resume[block.key]["dir"], "steps": start}} if start else {}),
             **({"sky": sky} if sky else {}),
         }
         report["blocks"][block.key] = {k: results[block.key].get(k) for k in ("frames", "train_frames", "eval", "kept", "sky")}
@@ -607,7 +655,7 @@ def _train_blocks(v: Version, scene: Scene, quality: str, steps: int, max_resolu
     # In plan order (the overlay's numbering).
     results = {block.key: results[block.key] for block in blocks}
     return _write_lod_list([rads[block.key] for block in blocks], work / "tiles.json"), {
-        "block_frames": TRAIN_BLOCK_FRAMES, "steps_total": sum(n for _, n in plan), "blocks": results,
+        "block_frames": TRAIN_BLOCK_FRAMES, "steps_total": sum(n - start for _, n, start in plan), "blocks": results,
         "settings": settings, "geo": geo,
         **({"reused_from": bp.ancestor.number} if bp.reused else {}),
         **({"frames": frames.as_dict()} if frames else {}), **({"dense_init": dense_init} if cloud is not None else {})}
@@ -620,6 +668,17 @@ class _BlockPlan:
     ancestor: Version | None  # nearest earlier version trained in blocks at this quality
     reused: dict[str, dict]  # key -> the ancestor's result for a block that stays as it is
     stale: dict[str, str]  # key -> why it trains
+    resume: dict[str, dict] = field(default_factory=dict)  # key -> the result it trains on from (more steps)
+
+
+def _prioritise(blocks: list[Block], scene: Scene) -> list[Block]:
+    """Blocks mostly seen by the TRAIN_BLOCKS_FIRST videos first, otherwise in plan order."""
+    first = {p.strip() for p in scene_setting(scene.settings, "TRAIN_BLOCKS_FIRST", TRAIN_BLOCKS_FIRST).split(",")
+             if p.strip()}
+    if not first:
+        return blocks
+    share = {b.key: sum(n.split("/")[0] in first for n in b.core) / max(len(b.core), 1) for b in blocks}
+    return sorted(blocks, key=lambda b: share[b.key] < 0.5)
 
 
 def _block_settings(scene: Scene) -> dict:
@@ -630,11 +689,13 @@ def _block_settings(scene: Scene) -> dict:
         ("dense_init", "TRAIN_DENSE_INIT", TRAIN_DENSE_INIT), ("sky_every", "TRAIN_SKY_EVERY", TRAIN_SKY_EVERY))}
 
 
-def _trained_ancestor(v: Version, quality: str | None) -> tuple[Version, str] | None:
-    """Nearest earlier version trained in blocks at this quality (None: at any, full first)."""
+def _trained_ancestor(v: Version, quality: str | None, itself: bool = False) -> tuple[Version, str] | None:
+    """Nearest earlier version trained in blocks at this quality (None: at any, full first);
+    `itself`: the version's own earlier training counts (training it again, on to more steps)."""
     qualities = [quality] if quality else ["full", "quick"]
     with session_scope() as session:
-        parent = session.get(Version, v.parent_id) if v.parent_id else None
+        start = v.id if itself else v.parent_id
+        parent = session.get(Version, start) if start else None
         while parent is not None:
             for q in qualities:
                 if parent.metrics.get(f"splat_{q}", {}).get("blocks"):
@@ -660,14 +721,14 @@ def _trained_frames(result: dict, posed: set[str]) -> set[str]:
     return {im.name for im in model.images.values() if im.has_pose} & posed
 
 
-def _plan_blocks(v: Version, quality: str, steps: int, max_resolution: int, settings: dict,
+def _plan_blocks(v: Version, quality: str, steps_of: Callable[[Block], int], max_resolution: int, settings: dict,
                  rec: pycolmap.Reconstruction) -> _BlockPlan:
     """The version's blocks, keeping the trained ancestor's (plan_blocks `keep`, in its map
     frame, so its splats and the new blocks' crops meet at the same seams), and which of them
     must train: a new or grown block, one whose frames moved, one with TRAIN_STALE_FRAMES new
     frames of its own, or new frames in its margin beyond TRAIN_STALE_MARGIN of its own frames.
     `rec`: the version's model with its SfM points cleaned, as training uses it."""
-    found = _trained_ancestor(v, quality)
+    found = _trained_ancestor(v, quality, itself=True)
     if found is None:
         blocks = plan_blocks(rec, v.metrics["geo"], TRAIN_BLOCK_FRAMES)
         return _BlockPlan(v.metrics["geo"], blocks, None, {}, {block.key: "new" for block in blocks})
@@ -684,10 +745,10 @@ def _plan_blocks(v: Version, quality: str, steps: int, max_resolution: int, sett
     metre = float(np.linalg.norm(np.array(geo["scene_from_enu"])[:3, 0]))  # scene units per metre
     moved = {name for name in now.keys() & was.keys() if _moved(was[name], now[name], metre)}
     # Blocks from before settings were recorded were trained with the scene's settings then.
-    same = old.get("steps") == steps and old.get("max_resolution") == max_resolution and \
-        old.get("settings", settings) == settings
+    # Steps count per block: fewer than asked train on from where they stopped, more are kept.
+    same = old.get("max_resolution") == max_resolution and old.get("settings", settings) == settings
 
-    reused, stale = {}, {}
+    reused, stale, resume = {}, {}, {}
     for block in blocks:
         result = old["blocks"].get(block.key)
         own = len(added & set(block.core))
@@ -704,9 +765,13 @@ def _plan_blocks(v: Version, quality: str, steps: int, max_resolution: int, sett
             stale[block.key] = f"{own} new frames"
         elif margin > TRAIN_STALE_MARGIN * len(block.core):
             stale[block.key] = f"{margin} new frames in its margin"
+        elif (had := result.get("steps", old.get("steps"))) < (steps := steps_of(block)):
+            stale[block.key] = f"{had}/{steps} steps"
+            if (DATA_ROOT / result["dir"] / "resume.ply").exists():
+                resume[block.key] = result | {"steps": had}
         else:
             reused[block.key] = result
-    return _BlockPlan(geo, blocks, ancestor, reused, stale)
+    return _BlockPlan(geo, blocks, ancestor, reused, stale, resume)
 
 
 def inherit_blocks(version_id: int) -> None:
@@ -728,12 +793,13 @@ def inherit_blocks(version_id: int) -> None:
     max_resolution = scene_setting(scene.settings, f"TRAIN_{quality.upper()}_RES", max_resolution)
     rec = pycolmap.Reconstruction(DATA_ROOT / v.reconstruction_path)
     clean_sparse(rec)
-    bp = _plan_blocks(v, quality, steps, max_resolution, _block_settings(scene), rec)
+    bp = _plan_blocks(v, quality, _steps_of(v, scene, steps), max_resolution, _block_settings(scene), rec)
+    bp.blocks = _prioritise(bp.blocks, scene)
     rads = [DATA_ROOT / b["dir"] / "lod" / "splat-lod.rad" for b in ancestor.metrics[f"splat_{quality}"]["blocks"].values()]
     work = SCENES_ROOT / scene.slug / "versions" / f"v{v.number}" / f"{quality}_inherited"
     work.mkdir(parents=True, exist_ok=True)
     tiles = _write_lod_list(rads, work / "tiles.json")
-    _save_block_plan(version_id, bp, quality)
+    _save_block_plan(version_id, bp, rec, quality)
     with session_scope() as session:
         v = session.get(Version, version_id)
         if v.splat_url:  # trained meanwhile
@@ -747,11 +813,11 @@ def inherit_blocks(version_id: int) -> None:
              ancestor.number, len(bp.stale), ", ".join(f"{k}: {r}" for k, r in bp.stale.items()))
 
 
-def _save_block_plan(version_id: int, bp: _BlockPlan, quality: str | None = None) -> None:
+def _save_block_plan(version_id: int, bp: _BlockPlan, rec: pycolmap.Reconstruction, quality: str | None = None) -> None:
     """Each block's ground cells in training order and whether it is reused or must train, for
     the viewer's block overlay (kept after training, unlike the report). `quality`: the
     ancestor's splat the version shows until it trains its own (inherit_blocks)."""
-    plan = block_plan(bp.blocks)
+    plan = block_plan(bp.blocks, rec, bp.geo)
     for entry in plan:
         if entry["key"] in bp.reused:
             entry |= {"status": "reused", "from": bp.reused[entry["key"]].get("from", bp.ancestor.number)}
@@ -776,22 +842,31 @@ def _report(version_id: int, report: dict) -> None:
         session.commit()
 
 
-def _videos(v: Version) -> list[Video]:
+def _videos(v: Version, rigs: bool = False) -> list[Video]:
     """The version's videos as named in its reconstruction: frames are c<id>/..., <id> being
     the contribution that uploaded the video (stored as <scene>/uploads/<id>_<file>; a cloned
     scene keeps the original's names and files, so its frames.json is with the original's
-    contributions, and a video added to the clone has its own)."""
+    contributions, and a video added to the clone has its own). With `rigs`, its rig videos
+    instead (worker.pipeline.devices.insta360)."""
     with session_scope() as session:
         contributions = [session.get(Contribution, i) for i in v.contribution_ids]
     videos = []
     for c in contributions:
         upload = DATA_ROOT / c.video_path  # absolute paths stay as they are
         prefix = "c" + upload.name.split("_", 1)[0]
-        if read_rig(upload.parent.parent / "images" / prefix):
-            continue  # a rig's views are rendered at ingest (worker.pipeline.devices.insta360)
+        if bool(read_rig(upload.parent.parent / "images" / prefix)) != rigs:
+            continue
         frames = json.loads((upload.parent.parent / "contributions" / prefix / "frames.json").read_text())
         videos.append(Video(prefix, Path(c.video_path), frames, DECODE_THREADS))
     return videos
+
+
+def _steps_of(v: Version, scene: Scene, steps: int) -> Callable[[Block], int]:
+    """A block's steps: the scene's TRAIN_RIG_STEPS for blocks mostly of rig frames, if set."""
+    rig_steps = scene_setting(scene.settings, "TRAIN_RIG_STEPS", TRAIN_RIG_STEPS)
+    rigs = _rig_prefixes(v) if rig_steps else set()
+    return lambda block: rig_steps if rig_steps and sum(n.split("/")[0] in rigs for n in block.core) > len(block.core) / 2 \
+        else steps
 
 
 def _rig_prefixes(v: Version) -> set[str]:
@@ -807,24 +882,29 @@ def _training_frames(v: Version, scene: Scene, full: pycolmap.Reconstruction, re
                      timing: TimingModel, prefixes: set[str] | None = None) -> tuple[dict[str, str], FrameStats]:
     """One camera per video, keyframes at full resolution and extra frames, per the scene's
     settings (worker.pipeline.splat.frames), the latter two for the videos in `prefixes` (None:
-    all). Changes `full` (and `rec`'s poses to match); returns extra frame -> the keyframe it
-    follows, and the stats."""
+    all); rig videos get only their extra moments (TRAIN_RIG_EXTRA_FRAMES). Changes `full` (and
+    `rec`'s poses to match); returns extra frame -> the keyframe it follows, and the stats."""
     side = scene_setting(scene.settings, "TRAIN_FRAME_SIDE", TRAIN_FRAME_SIDE)
     extra = scene_setting(scene.settings, "TRAIN_EXTRA_FRAMES", TRAIN_EXTRA_FRAMES)
-    videos = [video for video in _videos(v) if prefixes is None or video.prefix in prefixes]
+    rig_extra = scene_setting(scene.settings, "TRAIN_RIG_EXTRA_FRAMES", TRAIN_RIG_EXTRA_FRAMES)
+    wanted = lambda video: prefixes is None or video.prefix in prefixes  # noqa: E731
+    videos = [video for video in _videos(v) if wanted(video)] if side or extra else []
+    rig_videos = [video for video in _videos(v, rigs=True) if wanted(video)] if rig_extra else []
     stats = FrameStats(keyframes=sum(1 for im in full.images.values() if im.has_pose))
     gaps = sum(len(video.frames) - 1 for video in videos) * extra
+    rig_gaps = sum(len(video.frames) - 1 for video in rig_videos) * rig_extra
     substeps = [("cameras", stats.keyframes)]
-    if side or extra:
-        substeps += [("pick", sum(candidates(video) for video in videos) if extra else 0),
-                     ("decode", (stats.keyframes if side else 0) + gaps)]
-    if extra:
-        substeps += [("pose", gaps)]
+    if videos or rig_videos:
+        substeps += [("pick", sum(candidates(video) for video in videos if extra)
+                      + sum(candidates(video) for video in rig_videos)),
+                     ("decode", (stats.keyframes if side else 0) + gaps + rig_gaps)]
+    if gaps or rig_gaps:
+        substeps += [("pose", gaps + rig_gaps * len(VIEWS))]
     progress.start("frames", substeps=substeps)
 
-    # Rig videos train on the views rendered at ingest, as they are.
+    # Rig videos train on the views rendered at ingest, as they are (plus their extra moments).
     rigs = _rig_prefixes(v)
-    for prefix in rigs:
+    for prefix in rigs - {video.prefix for video in rig_videos}:
         link = train_root / prefix
         if not link.exists():
             link.parent.mkdir(parents=True, exist_ok=True)
@@ -835,7 +915,7 @@ def _training_frames(v: Version, scene: Scene, full: pycolmap.Reconstruction, re
         progress.counts(stats.keyframes, stats.keyframes)
 
     follows: dict[str, str] = {}
-    if side or extra:
+    if videos or rig_videos:
         lock, count = threading.Lock(), [0]
 
         def tick(n: int, total: int) -> None:
@@ -850,18 +930,32 @@ def _training_frames(v: Version, scene: Scene, full: pycolmap.Reconstruction, re
                 for video in videos:
                     metas[video.prefix] = plan_images(video, train_root / video.prefix, side, extra, pool,
                                                       lambda n: tick(n, total))
+                for video in rig_videos:
+                    metas[video.prefix] = plan_images(video, train_root / video.prefix, 0, rig_extra, pool,
+                                                      lambda n: tick(n, total))
             todo = [m for m in metas.values() if not m["decoded"]]
-            total = sum((len(m["keyframes"]) if side else 0) + len(m["extras"]) for m in todo)
+            total = sum((len(m["keyframes"]) if m["side"] else 0) + len(m["extras"]) for m in todo)
             count[0] = 0
             with progress.step("decode", total):
                 for video in videos:
                     metas[video.prefix] = decode_images(video, metas[video.prefix], train_root / video.prefix,
                                                         image_root, pool, lambda n: tick(n, total))
+                for video in rig_videos:
+                    metas[video.prefix] = decode_rig_images(video, metas[video.prefix], train_root / video.prefix,
+                                                            image_root, image_root.parent / MASKS_DIR, pool,
+                                                            lambda n: tick(n, total))
         stats.full_resolution = stats.keyframes if side else 0
-        if extra:
-            with progress.step("pose", gaps):
-                follows = add_extra_frames(full, videos, metas, cameras, image_root, train_root, held_out, stats,
-                                           progress.counts)
+        if gaps or rig_gaps:
+            # A rig's views are posed one by one, each like a video of that view.
+            view_camera = {im.name.rsplit("/", 1)[0]: im.camera_id for im in full.images.values() if im.has_pose}
+            views = [Video(f"{video.prefix}/{view}", video.path, video.frames, video.segments)
+                     for video in rig_videos for view in VIEWS]
+            metas |= {view.prefix: metas[view.prefix.split("/")[0]] for view in views}
+            cameras = cameras | {view.prefix: view_camera[view.prefix] for view in views if view.prefix in view_camera}
+            views = [view for view in views if view.prefix in cameras]
+            with progress.step("pose", gaps + rig_gaps * len(VIEWS)):
+                follows = add_extra_frames(full, (videos if extra else []) + views, metas, cameras, image_root,
+                                           train_root, held_out, stats, progress.counts)
     progress.finish()
     log.info("version %s training frames: %s", v.id, json.dumps(stats.as_dict()))
     return follows, stats
@@ -899,6 +993,9 @@ def train_version(version_id: int) -> None:
     image_root = SCENES_ROOT / Path(v.reconstruction_path).parts[1] / "images"
     blocks = quality != "uniform" and TRAIN_BLOCK_FRAMES > 0 and bool(v.metrics.get("geo"))
     work = SCENES_ROOT / scene.slug / "versions" / f"v{v.number}" / (f"{quality}_blocks" if blocks else quality)
+    if blocks and v.metrics.get(f"splat_{quality}", {}).get("blocks"):
+        # Trained before: its blocks stay, to be kept or trained on from (_plan_blocks).
+        work = next(p for k in itertools.count(2) if not (p := work.with_name(f"{work.name}_{k}")).exists())
     if users := _block_users(v, work):
         raise RuntimeError(f"its {quality} blocks are reused by {', '.join(users)}; train a newer version instead")
     shutil.rmtree(work, ignore_errors=True)
@@ -911,7 +1008,7 @@ def train_version(version_id: int) -> None:
         keyframes = v.metrics.get("registered") or 1000
         if any(scene_setting(scene.settings, name, default) for name, default in (
                 ("TRAIN_SHARED_CAMERAS", TRAIN_SHARED_CAMERAS), ("TRAIN_FRAME_SIDE", TRAIN_FRAME_SIDE),
-                ("TRAIN_EXTRA_FRAMES", TRAIN_EXTRA_FRAMES))):
+                ("TRAIN_EXTRA_FRAMES", TRAIN_EXTRA_FRAMES), ("TRAIN_RIG_EXTRA_FRAMES", TRAIN_RIG_EXTRA_FRAMES))):
             stages.insert(0, ("frames", timing.estimate("frames.decode", 2 * keyframes)))
         if scene_setting(scene.settings, "TRAIN_DENSE_INIT", TRAIN_DENSE_INIT) and v.metrics.get("dense_tiles"):
             stages.insert(-1, ("init", timing.estimate("init.sample", len(v.metrics["dense_tiles"]["tiles"]))))

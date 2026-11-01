@@ -15,7 +15,12 @@ dependencies = [
   "uvicorn[standard]",
   "sqlmodel>=0.0.48",
   "python-multipart>=0.0.32",
+  "torchvision>=0.29.2",
+  "lightglue",
 ]
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+lightglue = { git = "https://github.com/cvg/LightGlue.git" }

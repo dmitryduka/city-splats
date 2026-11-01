@@ -19,11 +19,13 @@ STEP_LABELS = {
     "extract": "Extracting features",
     "match_sequential": "Matching within video",
     "match_weak_links": "Re-matching weak links",
+    "verify": "Verifying matches",
     "match_retrieval": "Matching across videos",
     "map": "Mapping",
     "map_global": "Mapping, global (attempt 1)",
     "map_incremental": "Mapping, incremental",
     "map_global_2": "Mapping, global (retry)",
+    "map_repair": "Re-mapping a fold incrementally",
     "map_fisheye": "Mapping, fisheye lens",
     "submodel_merge": "Fitting via submodel (fallback)",
     "gate": "Consistency check",
@@ -38,8 +40,10 @@ STEP_LABELS = {
 # COLMAP source files whose log lines carry each step's progress (see ColmapProgress.source).
 _SOURCES = {
     "extract": "feature_extraction",
+    "verify": "pairing|feature_matching",
     "map_global": "global_mapper|global_pipeline",
     "map_global_2": "global_mapper|global_pipeline",
+    "map_repair": "incremental_pipeline",
     "map_fisheye": "global_mapper|global_pipeline",
     "map_incremental": "incremental_pipeline",
 }
@@ -103,7 +107,7 @@ class ConsoleReporter:
 
         render()
         with ColmapProgress(on_progress, total_hint=total, on_phase=on_phase):
-            yield
+            yield on_progress
         self.timings[name] = time.time() - started
         sys.stdout.write(f"\r\033[K  {title}: done in {format_duration(self.timings[name])}\n")
         sys.stdout.flush()
@@ -114,7 +118,8 @@ class FractionReporter:
     (a reconstruction run in its own process, worker.pipeline.piece_job): the detail names the
     running steps with COLMAP's counts, the fraction splits the stage roughly between steps."""
 
-    SPANS = {"extract": (0.0, 0.3), "match_sequential": (0.3, 0.4), "match_weak_links": (0.4, 0.45)}
+    SPANS = {"extract": (0.0, 0.3), "match_sequential": (0.3, 0.38), "verify": (0.38, 0.4),
+             "match_weak_links": (0.4, 0.45)}
     MAP_SPAN = (0.45, 1.0)
 
     def __init__(self, relay: Callable[[float, str | None], None]):
@@ -164,7 +169,7 @@ class FractionReporter:
         update(start)
         try:
             with ColmapProgress(on_progress, total_hint=total, on_phase=on_phase, source=log_source(name)):
-                yield
+                yield on_progress  # for steps that count their own work (not COLMAP's log)
         finally:
             with self.lock:
                 self.active.pop(name, None)

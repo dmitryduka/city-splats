@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 from sqlmodel import select
 
-from backend.app.config import DEPTH_MODEL, SCENES_ROOT, scene_setting
+from backend.app.config import DEPTH_MODEL, RIG_KEYFRAME_INTERVAL, SCENES_ROOT, scene_setting
 from backend.app.db import session_scope
 from backend.app.models import Contribution, Scene, Version
 from worker.pipeline.dense import predict_depth
@@ -42,7 +42,7 @@ from worker.pipeline.devices.dji import read_track
 from worker.pipeline.features import DEFAULT_FEATURES
 from worker.pipeline.ingest import extract_keyframes
 from worker.pipeline.masks import MASKS_DIR, MOVABLE_DIR, SKY_DIR, movable_masks
-from worker.pipeline.sfm import InitialResult
+from worker.pipeline.sfm import MATCHED_MARKER, InitialResult
 
 log = logging.getLogger(__name__)
 
@@ -412,14 +412,15 @@ class Prefetcher:
                 frames = extract_keyframes(
                     Path(c.video_path), images, pool=self.decode_pool, segments=self.decode_threads,
                     on_progress=lambda f: relay(f, f"Decoding {f:.0%} of the video, picking sharp frames by motion"),
-                    **({"decode": insta360.decode_views, "written_name": lambda n: f"{insta360.REF_VIEW}/{n}"}
-                       if rig else {}),
+                    **({"decode": insta360.decode_views, "written_name": lambda n: f"{insta360.REF_VIEW}/{n}",
+                        "max_interval": RIG_KEYFRAME_INTERVAL,
+                        "min_sharpness_ratio": 0.0} if rig else {}),
                 )
                 (work / "frames.json").write_text(json.dumps([f.__dict__ for f in frames]))
                 done = {"seconds": round(time.time() - started, 1)}
                 if rig:
                     # Street rides: traffic and the rider are masked before SfM sees them.
-                    names = image_names(SCENES_ROOT / slug / "images", c.image_dir_name, [f["name"] for f in frames])
+                    names = image_names(SCENES_ROOT / slug / "images", c.image_dir_name, [f.name for f in frames])
                     done["masks"] = movable_masks(
                         SCENES_ROOT / slug, SCENES_ROOT / slug / "images", names,
                         on_progress=lambda n, total: relay(n / total, f"Masking traffic {n}/{total}"))
@@ -444,7 +445,7 @@ class Prefetcher:
             if not (out / DEPTH_MARKER).exists():
                 if not _pending(c.id):
                     raise RuntimeError(f"contribution {c.id} is no longer queued")
-                shutil.rmtree(out, ignore_errors=True)
+                # Depth maps of an interrupted run are kept (by image name; depth_net skips them).
                 with session_scope() as session:
                     settings = session.get(Scene, c.scene_id).settings
                 predict_depth(SCENES_ROOT / slug / "images", names, out, scene_setting(settings, "DEPTH_MODEL", DEPTH_MODEL),
@@ -468,8 +469,9 @@ class Prefetcher:
             if not marker.exists():
                 if not _pending(c.id):
                     raise RuntimeError(f"contribution {c.id} is no longer queued")
-                shutil.rmtree(out, ignore_errors=True)
-                out.mkdir(parents=True)
+                if not (out / MATCHED_MARKER).exists():  # else its features and matches are reused (sfm)
+                    shutil.rmtree(out, ignore_errors=True)
+                out.mkdir(parents=True, exist_ok=True)
                 started = time.time()
                 relay(0.0, f"Starting on {threads} cores")
                 gps = _write_gps(Path(c.video_path), work_dir(c, slug) / "frames.json", c.image_dir_name, out)

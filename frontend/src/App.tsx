@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, contributionColor, SHARED_COLOR, SPLAT_KIND_LABELS, SPLAT_KINDS, useSceneState, type Scene, type SplatKind } from "./api";
+import { api, contributionColor, SHARED_COLOR, SPLAT_KIND_LABELS, SPLAT_KINDS, useSceneState, type Contribution, type Scene, type SplatKind } from "./api";
+import { ReplayBar } from "./components/ReplayBar";
 import { SceneList } from "./components/SceneList";
 import { ScenePanel } from "./components/ScenePanel";
+import { CameraReplay, videoPrefix, type CameraPaths } from "./viewer/cameraPath";
 import { SplatViewer, type ViewMode } from "./viewer/SplatViewer";
 import type { Geo, MapStyle } from "./viewer/mapTiles";
 import { BLOCK_COLORS, BLOCK_LABELS, blockOverlays, type BlockOverlay } from "./viewer/blockOverlay";
@@ -83,6 +85,12 @@ export default function App() {
   const [fps, setFps] = useState(0);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const onStats = useCallback((s: { fps: number }) => setFps(s.fps), []);
+  // Replaying a video's camera path (Play on its card); the speed is kept between replays.
+  const [replay, setReplay] = useState<{ replay: CameraReplay; label: string } | null>(null);
+  const replayRef = useRef(replay);
+  replayRef.current = replay;
+  const [replaySpeed, setReplaySpeed] = useState(1);
+  const [cameraPaths, setCameraPaths] = useState<CameraPaths | null>(null);
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info") => {
     const id = Date.now() + Math.random();
@@ -105,7 +113,10 @@ export default function App() {
   useEffect(() => {
     if (!slug && scenes.length) window.location.hash = `#/scenes/${scenes[0].slug}`;
   }, [slug, scenes]);
-  useEffect(() => setViewingVersionId(null), [slug]);
+  useEffect(() => {
+    setViewingVersionId(null);
+    setReplay(null);
+  }, [slug]);
 
   // Notifications: new HEAD, rejected/failed videos.
   const seen = useRef<{ slug: string | null; head: number | null; kind: string; statuses: Map<number, string> }>({
@@ -145,7 +156,9 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setReplay(null);
       if ((e.target as HTMLElement).tagName === "INPUT") return;
+      if ((e.key === "p" || e.key === "P") && replayRef.current) replayRef.current.replay.paused = !replayRef.current.replay.paused;
       if (MODE_KEYS[e.key]) show(MODE_KEYS[e.key]);
       if (e.key === "v" || e.key === "V") show(modeRef.current === "splats" ? "dense" : "splats");
       if (e.key === "c" || e.key === "C") setShowCameras((v) => !v);
@@ -184,6 +197,31 @@ export default function App() {
       ? selected?.dense_url || null
       : live?.preview_url || (kind && selected?.splats?.[kind]) || selected?.splat_url || null;
   const layersUrl = selected?.layers_url ?? null;
+  // Written next to the layers (worker.pipeline.camera_paths); older versions may lack it.
+  useEffect(() => {
+    setCameraPaths(null);
+    if (!layersUrl) return;
+    let cancelled = false;
+    fetch(`${layersUrl}/camera_paths.json`)
+      .then((r) => (r.ok ? (r.json() as Promise<CameraPaths>) : null))
+      .then((paths) => !cancelled && setCameraPaths(paths))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [layersUrl]);
+  const pathOf = (c: Contribution) => {
+    const prefix = videoPrefix(c.video_path);
+    const rows = prefix === "fov" ? null : cameraPaths?.[prefix];
+    return rows && rows.length >= 2 ? rows : null;
+  };
+  const play = (c: Contribution) => {
+    const rows = pathOf(c);
+    if (!rows) return;
+    const next = new CameraReplay(rows, cameraPaths?.fov?.[videoPrefix(c.video_path)] ?? null);
+    next.speed = replaySpeed;
+    setReplay({ replay: next, label: `#${c.seq} ${c.filename}` });
+  };
   // Parsed from its JSON so state updates (a new object each time) don't rebuild the map.
   const geoJson = JSON.stringify(selected?.metrics.geo ?? null);
   const geo = useMemo(() => JSON.parse(geoJson) as Geo | null, [geoJson]);
@@ -227,7 +265,20 @@ export default function App() {
           mapStyle={mapStyle}
           onMapSource={(attribution, failed) => setMapSource({ attribution, failed })}
           blocks={showBlocks ? blocks : null}
+          replay={replay?.replay ?? null}
+          onReplayEnd={() => setReplay(null)}
         />}
+        {replay && (
+          <ReplayBar
+            replay={replay.replay}
+            label={replay.label}
+            onSpeed={(s) => {
+              replay.replay.speed = s;
+              setReplaySpeed(s);
+            }}
+            onStop={() => setReplay(null)}
+          />
+        )}
         {state && !splatUrl && !selected && (
           <div className="empty">Upload a video to start reconstructing “{state.scene.name}”.</div>
         )}
@@ -348,7 +399,7 @@ export default function App() {
               </span>
             </div>
           )}
-          <div className="muted">WASD / drag · V cloud ⇄ splats · 1 cloud · 2 splats · 3 by video · 4 sparse · K splat kind · C cameras · M map · B blocks · [ ] splat size</div>
+          <div className="muted">WASD / drag · V cloud ⇄ splats · 1 cloud · 2 splats · 3 by video · 4 sparse · K splat kind · C cameras · M map · B blocks · [ ] splat size · ▶ on a video replays its path (P pause · Esc stop)</div>
           <label className="follow">
             <input type="checkbox" checked={followLive} onChange={(e) => setFollowLive(e.target.checked)} /> follow
             live training
@@ -367,6 +418,8 @@ export default function App() {
           state={state}
           viewingVersionId={viewingVersionId}
           onViewVersion={setViewingVersionId}
+          canReplay={(c) => pathOf(c) != null}
+          onReplay={play}
           onError={(m) => toast(m, "error")}
         />
       )}

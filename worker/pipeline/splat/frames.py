@@ -12,6 +12,11 @@
 - Extra frames: `extra` frames per gap between consecutive keyframes (the sharpest candidate
   around the gap's middle), posed by tracking the neighbouring keyframes' SfM observations
   into them (optical flow, forward-backward checked) and solving PnP against those points.
+- Rig videos (Insta360 rides) keep their rendered views and cameras; their extra moments are
+  rendered into every view (decode_rig_images) and each view of them is posed on its own, like
+  an extra frame of a video of that view. On the first ride, 70-100 s (fast, over an overpass:
+  keyframes 0.33 s and ~8 m apart) had 150-320 SfM observations per view and tracks of 4-6
+  views, against 600-900 and 10-19 elsewhere, and its splats were the weakest.
 
 Images are cached per video under the scene's train_images/<video>/ (decoding is the slow
 part); poses are recomputed for each training run against its reconstruction.
@@ -31,7 +36,9 @@ import cv2
 import numpy as np
 import pycolmap
 
+from worker.pipeline.devices.insta360 import VIEWS, decode_views
 from worker.pipeline.ingest import _analyse, decode_samples, probe, sample_ranges
+from worker.pipeline.masks import between_masks
 
 # Ingest's candidate rate: keyframe timestamps are sample / 15 (worker.pipeline.ingest).
 CANDIDATE_FPS = 15.0
@@ -193,6 +200,33 @@ def decode_images(video: Video, meta: dict, out_dir: Path, image_root: Path, poo
     return meta
 
 
+def decode_rig_images(video: Video, meta: dict, out_dir: Path, image_root: Path, mask_root: Path, pool: Executor,
+                      tick: Callable[[int], None]) -> dict:
+    """decode_images for a rig video (worker.pipeline.devices.insta360): its keyframes' views
+    linked to the stored ones, its extra moments rendered into every view (out_dir/<view>/),
+    each with the mask of its two neighbouring keyframes' view (masks.between_masks)."""
+    if meta["decoded"]:
+        return meta
+    if out_dir.is_symlink():  # an earlier run trained on the stored views as they are
+        out_dir.unlink()
+    for view in VIEWS:
+        (out_dir / view).mkdir(parents=True, exist_ok=True)
+        for name in meta["keyframes"]:
+            link = out_dir / view / name
+            link.unlink(missing_ok=True)
+            link.symlink_to((image_root / video.prefix / view / name).resolve())
+    info = probe(video.path)
+    fps = min(CANDIDATE_FPS, info.fps)
+    decode_views(info, {e["sample"]: e["name"] for e in meta["extras"]}, out_dir,
+                 sample_ranges(info, fps, video.segments), fps, pool,
+                 lambda done: tick(10) if done % 10 == 0 else None)
+    between_masks(mask_root, [(f"{video.prefix}/{view}/{e['name']}", f"{video.prefix}/{view}/{e['after']}",
+                               f"{video.prefix}/{view}/{e['before']}") for e in meta["extras"] for view in VIEWS])
+    meta = meta | {"decoded": True, "width": info.width, "height": info.height}
+    (out_dir / "meta.json").write_text(json.dumps(meta))
+    return meta
+
+
 def _gray(path: Path, size: tuple[int, int]) -> np.ndarray:
     image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if image.shape[1] != size[0]:
@@ -254,18 +288,36 @@ def add_extra_frames(rec: pycolmap.Reconstruction, videos: list[Video], metas: d
     with ThreadPoolExecutor(workers) as pool:
         posed = [p for p in pool.map(pose, jobs) if p is not None]
     follows = {}
-    # A trivial frame takes the image's id, so the id must be free as a frame id too.
+    # The frame takes the image's id, so the id must be free as a frame id too.
     next_id = max(max(rec.images), max(rec.frames)) + 1
+    # Each camera's single-camera rig; its id isn't the camera's once a scene has rigs of
+    # virtual views (they take more rig ids than cameras), which add_image_with_trivial_frame assumes.
+    rig_of = {rig.ref_sensor_id.id: rid for rid, rig in rec.rigs.items() if rig.num_sensors() == 1}
+    for camera_id in {cameras[prefix] for prefix, _, _, _ in posed} - rig_of.keys():
+        # A rig video's view: its camera is in the video's rig; an extra frame of one view
+        # stands alone (posed on its own), so it gets a rig of just that camera.
+        rig = pycolmap.Rig()
+        rig.rig_id = max(rec.rigs) + 1
+        rig.add_ref_sensor(rec.cameras[camera_id].sensor_id)
+        rec.add_rig(rig)
+        rig_of[camera_id] = rig.rig_id
     inliers = defaultdict(list)
     for prefix, e, cam_from_world, n in posed:
         name = f"{prefix}/{e['name']}"
         image = pycolmap.Image(name=name, camera_id=cameras[prefix], image_id=next_id)
-        rec.add_image_with_trivial_frame(image, cam_from_world)
+        image.frame_id = next_id
+        frame = pycolmap.Frame()
+        frame.frame_id, frame.rig_id, frame.rig_from_world = next_id, rig_of[cameras[prefix]], cam_from_world
+        frame.add_data_id(image.data_id)
+        rec.add_frame(frame)
+        rec.add_image(image)
+        rec.register_frame(next_id)
         next_id += 1
         follows[name] = f"{prefix}/{e['after']}"
         inliers[prefix].append(n)
     for prefix, values in inliers.items():
-        stats.videos[prefix] |= {"extra_posed": len(values), "extra_inliers_median": int(np.median(values))}
+        stats.videos[prefix] = stats.videos.get(prefix, {}) | {"extra_posed": len(values),
+                                                               "extra_inliers_median": int(np.median(values))}
     stats.extra_posed = len(posed)
     on_progress(len(jobs), len(jobs))
     return follows

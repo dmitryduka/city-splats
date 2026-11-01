@@ -28,6 +28,8 @@ export type Contribution = {
   scene_id: number;
   seq: number;
   filename: string;
+  /** Where the upload is (absolute, or relative to the data root); names its frames (c<id>). */
+  video_path: string;
   status: ContributionStatus;
   stage: string | null;
   stage_progress: number;

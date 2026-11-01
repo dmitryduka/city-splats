@@ -89,6 +89,9 @@ type Props = {
   viewingVersionId: number | null;
   onViewVersion: (versionId: number | null) => void;
   onError: (message: string) => void;
+  /** Whether the viewed version has this video's camera path, and replaying it. */
+  canReplay: (c: Contribution) => boolean;
+  onReplay: (c: Contribution) => void;
 };
 
 function Upload({ slug, onError }: { slug: string; onError: (m: string) => void }) {
@@ -153,7 +156,7 @@ function Upload({ slug, onError }: { slug: string; onError: (m: string) => void 
   );
 }
 
-function ContributionCard({ c }: { c: Contribution }) {
+function ContributionCard({ c, onReplay }: { c: Contribution; onReplay: (() => void) | null }) {
   const m = c.metrics as Record<string, number | string | boolean | undefined>;
   // A queued video whose own stages (frames, 3D model, depth) run ahead of the queue shows
   // as processing; only fitting into the scene waits for the videos before it.
@@ -171,6 +174,11 @@ function ContributionCard({ c }: { c: Contribution }) {
         <span className="title">
           #{c.seq} {c.filename}
         </span>
+        {onReplay && (
+          <button className="replay" onClick={onReplay} title="Fly the camera along this video's path, at the footage's pace">
+            ▶ Play
+          </button>
+        )}
         <span className={`badge ${active ? "processing" : c.status}`}>{active ? "processing" : c.status}</span>
       </div>
       {active && (
@@ -419,7 +427,7 @@ function VersionRow({
   );
 }
 
-export function ScenePanel({ state, viewingVersionId, onViewVersion, onError }: Props) {
+export function ScenePanel({ state, viewingVersionId, onViewVersion, onError, canReplay, onReplay }: Props) {
   const slug = state.scene.slug;
   const contributions = [...state.contributions].reverse();
   const versions = [...state.versions].reverse();
@@ -434,7 +442,7 @@ export function ScenePanel({ state, viewingVersionId, onViewVersion, onError }: 
       {contributions.length === 0 && <div className="muted">No videos yet.</div>}
       <ul className="contributions">
         {contributions.map((c) => (
-          <ContributionCard key={c.id} c={c} />
+          <ContributionCard key={c.id} c={c} onReplay={canReplay(c) ? () => onReplay(c) : null} />
         ))}
       </ul>
 
