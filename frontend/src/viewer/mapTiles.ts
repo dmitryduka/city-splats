@@ -8,7 +8,41 @@ export type Geo = {
   /** Camera centres' east/north bounds in metres: [minE, minN, maxE, maxN]. */
   extent: [number, number, number, number];
   error_m: number;
+  /** Heights under the map (worker.pipeline.terrain): float32 map-frame z, north row first. */
+  terrain?: Terrain;
 };
+
+export type Terrain = { url: string; size: [number, number]; min: [number, number]; spacing_m: number };
+
+export type Heights = (x: number, y: number) => number;
+
+/** Bilinear height at map-frame x, y; beyond the grid, its edge. */
+function heightsOf(t: Terrain, z: Float32Array): Heights {
+  const [nx, ny] = t.size;
+  return (x, y) => {
+    const c = Math.min(Math.max((x - t.min[0]) / t.spacing_m, 0), nx - 1.001);
+    const r = Math.min(Math.max(ny - 1 - (y - t.min[1]) / t.spacing_m, 0), ny - 1.001);
+    const j = Math.floor(c), i = Math.floor(r), fc = c - j, fr = r - i;
+    const at = (ii: number, jj: number) => z[ii * nx + jj];
+    return (at(i, j) * (1 - fc) + at(i, j + 1) * fc) * (1 - fr) + (at(i + 1, j) * (1 - fc) + at(i + 1, j + 1) * fc) * fr;
+  };
+}
+
+// One fetch per terrain grid, shared by the map and the place labels.
+const loadedHeights = new Map<string, Promise<Heights>>();
+
+/** The terrain's height sampler, once its grid has loaded. */
+export function loadHeights(t: Terrain): Promise<Heights> {
+  let heights = loadedHeights.get(t.url);
+  if (!heights) {
+    heights = fetch(t.url)
+      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(r.status)))
+      .then((buffer) => heightsOf(t, new Float32Array(buffer)));
+    heights.catch(() => loadedHeights.delete(t.url));
+    loadedHeights.set(t.url, heights);
+  }
+  return heights;
+}
 
 export type MapStyle = "street" | "satellite";
 
@@ -43,6 +77,8 @@ export type MapLayer = {
   group: THREE.Group;
   /** Load tiles around the camera (world position), wherever it has flown. */
   follow: (cameraWorld: THREE.Vector3) => void;
+  /** Raise (or lower) the map by metres, to line it up with the scene by eye. */
+  setLift: (metres: number) => void;
   dispose: () => void;
 };
 
@@ -56,6 +92,8 @@ const TILE_MIN_M = 75;
 const TILE_MAX_M = 5000;
 const ZOOM_HYSTERESIS = 0.7;
 const MAX_LOADED = 200;
+/** Terrain mesh: a vertex every grid step, at most this many quads along a tile's side. */
+const MAX_SEGMENTS = 48;
 
 /**
  * Map tiles as textured quads in the map frame (x east, y north, metres; tiles are spaced by
@@ -70,7 +108,8 @@ export function buildMap(
 ): MapLayer {
   const group = new THREE.Group();
   group.matrixAutoUpdate = false;
-  group.matrix.set(...(geo.scene_from_map.flat() as Parameters<THREE.Matrix4["set"]>));
+  const sceneFromMap = new THREE.Matrix4().set(...(geo.scene_from_map.flat() as Parameters<THREE.Matrix4["set"]>));
+  group.matrix.copy(sceneFromMap);
   const [lat, lon] = geo.origin;
   const providers = PROVIDERS[style];
   const maxZoom = providers[0].maxZoom;
@@ -82,19 +121,41 @@ export function buildMap(
   let disposed = false;
   let failures = 0;
 
+  // Terrain: tiles made before it loads are draped when it does.
+  let heights: Heights | null = null;
+  const drape = (tile: Tile) => {
+    if (!heights) return;
+    const position = tile.geometry.attributes.position;
+    for (let k = 0; k < position.count; k++)
+      position.setZ(k, heights(tile.centre.x + position.getX(k), tile.centre.y + position.getY(k)));
+    position.needsUpdate = true;
+    tile.geometry.computeBoundingSphere();
+  };
+  if (geo.terrain) {
+    loadHeights(geo.terrain).then((loaded) => {
+      if (disposed) return;
+      heights = loaded;
+      tiles.forEach(drape);
+      onChange();
+    }).catch((e) => console.warn("terrain not loaded:", e));
+  }
+
   const addTile = (z: number, tx: number, ty: number) => {
     const key = `${z}/${tx}/${ty}`;
     if (tiles.has(key)) return;
     const m = metresPerTile(z);
     const [ox, oy] = tileXY(lat, lon, z);
-    const geometry = new THREE.PlaneGeometry(m, m);
+    const segments = geo.terrain ? Math.min(Math.max(Math.ceil(m / geo.terrain.spacing_m), 1), MAX_SEGMENTS) : 1;
+    const geometry = new THREE.PlaneGeometry(m, m, segments, segments);
     const material = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.position.set((tx + 0.5 - ox) * m, -(ty + 0.5 - oy) * m, 0);
     mesh.renderOrder = -2;
     mesh.visible = false;
     group.add(mesh);
-    tiles.set(key, { mesh, material, geometry, centre: new THREE.Vector2(mesh.position.x, mesh.position.y) });
+    const tile = { mesh, material, geometry, centre: new THREE.Vector2(mesh.position.x, mesh.position.y) };
+    tiles.set(key, tile);
+    drape(tile);
     const attempt = (k: number) => {
       if (k >= providers.length) {
         if (++failures === 1) onSource(providers[0].attribution, true);
@@ -133,7 +194,8 @@ export function buildMap(
     if (disposed) return;
     group.updateWorldMatrix(true, false);
     local.copy(cameraWorld).applyMatrix4(inverse.copy(group.matrixWorld).invert());
-    const height = Math.min(Math.max(Math.abs(local.z), TILE_MIN_M), TILE_MAX_M);
+    const ground = heights ? heights(local.x, local.y) : 0;
+    const height = Math.min(Math.max(Math.abs(local.z - ground), TILE_MIN_M), TILE_MAX_M);
     const wanted = Math.min(Math.max(Math.log2(metresPerTile(0) / height), 3), maxZoom);
     if (!zoom || Math.abs(wanted - zoom) > ZOOM_HYSTERESIS) {
       const next = Math.round(wanted);
@@ -160,9 +222,16 @@ export function buildMap(
     }
   };
 
+  const setLift = (metres: number) => {
+    group.matrix.multiplyMatrices(sceneFromMap, new THREE.Matrix4().makeTranslation(0, 0, metres));
+    group.matrixWorldNeedsUpdate = true;
+    onChange();
+  };
+
   return {
     group,
     follow,
+    setLift,
     dispose: () => {
       disposed = true;
       group.removeFromParent();

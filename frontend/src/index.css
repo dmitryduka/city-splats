@@ -117,3 +117,19 @@ button.link { background: none; border: none; padding: 2px 0; color: var(--accen
 .replay-bar input { width: 220px; }
 .replay-bar .replay-time { white-space: nowrap; }
 .replay-bar .surface-switch { margin: 0; }
+
+/* Place labels over the scene (viewer/placeLabels.ts): a dot, a stem, the name above. */
+.place-labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; user-select: none; }
+.place { position: absolute; top: 0; left: 0; transition: opacity .35s ease-out; }
+.place.off { opacity: 0; transition-duration: .5s; }
+.place .dot { position: absolute; top: -3px; left: -3px; width: 6px; height: 6px; border-radius: 50%;
+  background: #fff; box-shadow: 0 0 0 1.5px rgba(0, 0, 0, .8); }
+.place .stem { position: absolute; bottom: 3px; left: -.5px; width: 1px; height: 17px;
+  background: #fff; box-shadow: 0 0 0 .5px rgba(0, 0, 0, .5); }
+.place .txt { position: absolute; bottom: 20px; left: -1px; white-space: nowrap; color: #fff;
+  text-shadow: 0 0 2px #000, 0 0 2px #000, 0 1px 3px rgba(0, 0, 0, .9), 0 0 10px rgba(0, 0, 0, .45); }
+.place.left .txt { left: auto; right: -1px; text-align: right; }
+.place b { display: block; font-size: 12.5px; font-weight: 600; line-height: 1.2; }
+.place.major b { font-size: 14.5px; }
+.place span { display: none; color: #e8e8e8; font-size: 10.5px; font-weight: 500; line-height: 1.3; }
+.place.near span { display: block; }

@@ -25,7 +25,7 @@ export function ReplayBar({
     return () => clearInterval(timer);
   }, []);
   return (
-    <div className="replay-bar">
+    <div className="replay-bar" data-labels-avoid>
       <button onClick={() => ((replay.paused = !replay.paused), refresh())} title="P">
         {replay.paused ? "▶" : "❚❚"}
       </button>

@@ -68,10 +68,42 @@ export default function App() {
   const kindsRef = useRef<{ kinds: SplatKind[]; kind: SplatKind | null }>({ kinds: [], kind: null });
   const [showCameras, setShowCameras] = useState(false);
   const [showBlocks, setShowBlocks] = useState(true);
+  // Place names over GPS-placed scenes (L), remembered per browser.
+  const [showPlaces, setShowPlaces] = useState(() => {
+    try {
+      return localStorage.getItem("showPlaces") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("showPlaces", showPlaces ? "1" : "0");
+    } catch {
+      // private window: not remembered
+    }
+  }, [showPlaces]);
   const [mapStyle, setMapStyle] = useState<MapStyle | null>(null);
   // Cloud/splat opacity, offered while a map is shown so it can show through. Applied cubed:
   // many splats overlap along each ray, so per-splat opacity must drop fast to see through.
   const [opacity, setOpacity] = useState(1);
+  // The map's height by eye, metres, remembered per scene.
+  const [mapLift, setMapLift] = useState(0);
+  useEffect(() => {
+    try {
+      setMapLift(Number(localStorage.getItem(`mapLift:${slug}`) ?? 0));
+    } catch {
+      setMapLift(0);
+    }
+  }, [slug]);
+  const changeMapLift = (metres: number) => {
+    setMapLift(metres);
+    try {
+      localStorage.setItem(`mapLift:${slug}`, String(metres));
+    } catch {
+      // storage unavailable: not remembered
+    }
+  };
   const [speed, setSpeed] = useState(savedSpeed);
   useEffect(() => {
     try {
@@ -165,6 +197,10 @@ export default function App() {
       if (e.key === "b" || e.key === "B") {
         if (!geoRef.current) toast("No blocks to show: none of this version's videos has GPS", "error");
         else setShowBlocks((v) => !v);
+      }
+      if (e.key === "l" || e.key === "L") {
+        if (!geoRef.current) toast("No place names: none of this version's videos has GPS", "error");
+        else setShowPlaces((v) => !v);
       }
       if (e.key === "m" || e.key === "M") {
         if (!geoRef.current) toast("No map: none of this version's videos has GPS", "error");
@@ -263,6 +299,8 @@ export default function App() {
           onStats={onStats}
           geo={geo}
           mapStyle={mapStyle}
+          mapLift={mapLift}
+          showPlaces={showPlaces}
           onMapSource={(attribution, failed) => setMapSource({ attribution, failed })}
           blocks={showBlocks ? blocks : null}
           replay={replay?.replay ?? null}
@@ -292,7 +330,7 @@ export default function App() {
         {selected && !splatUrl && mode === "dense" && (
           <div className="empty">This version has no dense point cloud (made before dense clouds). Press V for splats or 3 / 4 for sparse points.</div>
         )}
-        <div className="hud">
+        <div className="hud" data-labels-avoid>
           <div>
             {live ? (
               <span className="live">
@@ -363,6 +401,14 @@ export default function App() {
               <span>{Math.round(opacity * 100)}%</span>
             </label>
           )}
+          {mapStyle && geo && (
+            <label className="size-slider" title="Raise or lower the map to line it up with the scene's ground">
+              map height
+              <input type="range" min={-40} max={20} step={0.5} value={mapLift}
+                onChange={(e) => changeMapLift(Number(e.target.value))} />
+              <span>{mapLift > 0 ? "+" : ""}{mapLift.toFixed(1)} m</span>
+            </label>
+          )}
           <div>
             {fps < 0.5 ? "idle (renders on demand)" : `${fps.toFixed(0)} fps`} · {MODE_LABELS[mode]}
             {showCameras ? " + cameras" : ""} {connected ? "" : "· reconnecting…"}
@@ -399,7 +445,7 @@ export default function App() {
               </span>
             </div>
           )}
-          <div className="muted">WASD / drag · V cloud ⇄ splats · 1 cloud · 2 splats · 3 by video · 4 sparse · K splat kind · C cameras · M map · B blocks · [ ] splat size · ▶ on a video replays its path (P pause · Esc stop)</div>
+          <div className="muted">WASD / drag · V cloud ⇄ splats · 1 cloud · 2 splats · 3 by video · 4 sparse · K splat kind · C cameras · M map · L place names · B blocks · [ ] splat size · ▶ on a video replays its path (P pause · Esc stop)</div>
           <label className="follow">
             <input type="checkbox" checked={followLive} onChange={(e) => setFollowLive(e.target.checked)} /> follow
             live training

@@ -4,6 +4,8 @@ import { PLYLoader } from "three/examples/jsm/loaders/PLYLoader.js";
 import { dyno, SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import { buildMap, type Geo, type MapLayer, type MapStyle } from "./mapTiles";
 import { buildBlocks, type BlockOverlay } from "./blockOverlay";
+import { buildPlaceLabels, type PlaceLabels } from "./placeLabels";
+import { PLACES } from "./places";
 import type { CameraReplay } from "./cameraPath";
 
 /** "dense" and "splats" both show the streamed meshes at splatUrl (a dense cloud is streamed
@@ -32,6 +34,10 @@ type Props = {
   /** Where the scene lies on the map (from GPS), and which map to lay under it (null: none). */
   geo?: Geo | null;
   mapStyle?: MapStyle | null;
+  /** Map raised by this many metres (negative: lowered); the place labels with it. */
+  mapLift?: number;
+  /** Names over known places (needs geo). */
+  showPlaces?: boolean;
   /** The map's attribution once tiles load; failed when no provider served a tile. */
   onMapSource?: (attribution: string, failed: boolean) => void;
   /** Splat training blocks drawn on the map plane (needs geo; null: hidden). */
@@ -55,6 +61,7 @@ type Context = {
   dirty: boolean;
   /** The map layer, told where the camera is so it loads tiles there. */
   map?: MapLayer;
+  places?: PlaceLabels;
 };
 
 /** Scales every splat by the size uniform at render time, so changing it needs no reload. */
@@ -108,6 +115,8 @@ export function SplatViewer({
   onStats,
   geo = null,
   mapStyle = null,
+  mapLift = 0,
+  showPlaces = false,
   onMapSource,
   blocks = null,
   replay = null,
@@ -121,6 +130,12 @@ export function SplatViewer({
   const controlsRef = useRef<SparkControls | null>(null);
   const moveSpeedRef = useRef(moveSpeed);
   moveSpeedRef.current = moveSpeed;
+  const mapLiftRef = useRef(mapLift);
+  mapLiftRef.current = mapLift;
+  useEffect(() => {
+    ctxRef.current?.map?.setLift(mapLift);
+    ctxRef.current?.places?.setLift(mapLift);
+  }, [mapLift]);
   const opacityRef = useRef(splatOpacity);
   opacityRef.current = splatOpacity;
   const onMapSourceRef = useRef(onMapSource);
@@ -191,6 +206,8 @@ export function SplatViewer({
     let frames = 0;
     let last = performance.now();
     const lastPose = new THREE.Matrix4();
+    // A place label is waiting for room to settle: place them again without rendering.
+    let placesWaiting = false;
     const replayPosition = new THREE.Vector3();
     const replayQuaternion = new THREE.Quaternion();
     let replayTick = 0;
@@ -237,6 +254,9 @@ export function SplatViewer({
         ctx.map?.follow(camera.position);
         renderer.render(scene, camera);
         frames++;
+        placesWaiting = ctx.places?.update(camera) ?? false;
+      } else if (placesWaiting) {
+        placesWaiting = ctx.places!.update(camera);
       }
       const now = performance.now();
       if (now - last > 1000) {
@@ -323,6 +343,7 @@ export function SplatViewer({
     const ctx = ctxRef.current;
     if (!ctx || !geo || !mapStyle) return;
     const map = buildMap(geo, mapStyle, () => (ctx.dirty = true), (a, failed) => onMapSourceRef.current?.(a, failed));
+    map.setLift(mapLiftRef.current);
     ctx.world.add(map.group);
     ctx.map = map;
     ctx.dirty = true;
@@ -332,6 +353,19 @@ export function SplatViewer({
       ctx.dirty = true;
     };
   }, [geo, mapStyle, pixelRatio, lodSplatScale]);
+
+  // Place labels over the scene.
+  useEffect(() => {
+    const ctx = ctxRef.current;
+    if (!ctx || !geo || !showPlaces) return;
+    const places = buildPlaceLabels(geo, PLACES, ctx.world, containerRef.current!, () => (ctx.dirty = true));
+    places.setLift(mapLiftRef.current);
+    ctx.places = places;
+    return () => {
+      if (ctx.places === places) ctx.places = undefined;
+      places.dispose();
+    };
+  }, [geo, showPlaces, pixelRatio, lodSplatScale]);
 
   // Training blocks on the map plane.
   useEffect(() => {
