@@ -35,6 +35,26 @@ const savedSpeed = () => {
 
 type Toast = { id: number; text: string; kind: "info" | "error" };
 
+/** A boolean setting remembered per browser (as long as storage works). */
+function useRemembered(key: string, initial: boolean) {
+  const [value, setValue] = useState(() => {
+    try {
+      const stored = localStorage.getItem(key);
+      return stored === null ? initial : stored === "1";
+    } catch {
+      return initial;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, value ? "1" : "0");
+    } catch {
+      // private window: not remembered
+    }
+  }, [key, value]);
+  return [value, setValue] as const;
+}
+
 const slugFromHash = () => window.location.hash.match(/^#\/scenes\/([^/]+)/)?.[1] ?? null;
 
 export default function App() {
@@ -68,21 +88,13 @@ export default function App() {
   const kindsRef = useRef<{ kinds: SplatKind[]; kind: SplatKind | null }>({ kinds: [], kind: null });
   const [showCameras, setShowCameras] = useState(false);
   const [showBlocks, setShowBlocks] = useState(true);
-  // Place names over GPS-placed scenes (L), remembered per browser.
-  const [showPlaces, setShowPlaces] = useState(() => {
-    try {
-      return localStorage.getItem("showPlaces") !== "0";
-    } catch {
-      return true;
-    }
-  });
-  useEffect(() => {
-    try {
-      localStorage.setItem("showPlaces", showPlaces ? "1" : "0");
-    } catch {
-      // private window: not remembered
-    }
-  }, [showPlaces]);
+  // Place names (L) and street names (N) over GPS-placed scenes.
+  const [showPlaces, setShowPlaces] = useRemembered("showPlaces", true);
+  const [showStreets, setShowStreets] = useRemembered("showStreets", false);
+  // Collapsed to a thin strip: the scene list, the HUD, the scene panel.
+  const [listCollapsed, setListCollapsed] = useRemembered("collapsed:list", false);
+  const [hudCollapsed, setHudCollapsed] = useRemembered("collapsed:hud", false);
+  const [panelCollapsed, setPanelCollapsed] = useRemembered("collapsed:panel", false);
   const [mapStyle, setMapStyle] = useState<MapStyle | null>(null);
   // Cloud/splat opacity, offered while a map is shown so it can show through. Applied cubed:
   // many splats overlap along each ray, so per-splat opacity must drop fast to see through.
@@ -202,6 +214,10 @@ export default function App() {
         if (!geoRef.current) toast("No place names: none of this version's videos has GPS", "error");
         else setShowPlaces((v) => !v);
       }
+      if (e.key === "n" || e.key === "N") {
+        if (!geoRef.current) toast("No street names: none of this version's videos has GPS", "error");
+        else setShowStreets((v) => !v);
+      }
       if (e.key === "m" || e.key === "M") {
         if (!geoRef.current) toast("No map: none of this version's videos has GPS", "error");
         else setMapStyle((s) => MAP_CYCLE[(MAP_CYCLE.indexOf(s) + 1) % MAP_CYCLE.length]);
@@ -274,16 +290,22 @@ export default function App() {
   );
 
   return (
-    <div className="layout">
-      <SceneList
-        scenes={scenes}
-        current={slug}
-        onSelect={(s) => (window.location.hash = `#/scenes/${s}`)}
-        onCreated={(scene) => {
-          refreshScenes();
-          window.location.hash = `#/scenes/${scene.slug}`;
-        }}
-      />
+    <div className="layout" style={{ gridTemplateColumns: `${listCollapsed ? "24px" : "220px"} 1fr ${panelCollapsed ? "24px" : "340px"}` }}>
+      {/* Collapsed sides stay mounted (hidden): the panel keeps uploads and their progress. */}
+      <div className={`side left${listCollapsed ? " collapsed" : ""}`}>
+        <button className="collapse" onClick={() => setListCollapsed((v) => !v)} title={listCollapsed ? "Show scenes" : "Hide scenes"}>
+          {listCollapsed ? "›" : "‹"}
+        </button>
+        <SceneList
+          scenes={scenes}
+          current={slug}
+          onSelect={(s) => (window.location.hash = `#/scenes/${s}`)}
+          onCreated={(scene) => {
+            refreshScenes();
+            window.location.hash = `#/scenes/${scene.slug}`;
+          }}
+        />
+      </div>
       <main className="viewport">
         {slug && <SplatViewer
           key={slug}
@@ -301,6 +323,7 @@ export default function App() {
           mapStyle={mapStyle}
           mapLift={mapLift}
           showPlaces={showPlaces}
+          showStreets={showStreets}
           onMapSource={(attribution, failed) => setMapSource({ attribution, failed })}
           blocks={showBlocks ? blocks : null}
           replay={replay?.replay ?? null}
@@ -330,8 +353,11 @@ export default function App() {
         {selected && !splatUrl && mode === "dense" && (
           <div className="empty">This version has no dense point cloud (made before dense clouds). Press V for splats or 3 / 4 for sparse points.</div>
         )}
-        <div className="hud" data-labels-avoid>
-          <div>
+        <div className={`hud${hudCollapsed ? " collapsed" : ""}`} data-labels-avoid>
+          <div className="hud-title">
+            <button className="collapse" onClick={() => setHudCollapsed((v) => !v)} title={hudCollapsed ? "Show controls" : "Hide controls"}>
+              {hudCollapsed ? "▸" : "▾"}
+            </button>
             {live ? (
               <span className="live">
                 ● LIVE {live.train_quality} training · v{live.number} · step {live.preview_step}
@@ -346,6 +372,9 @@ export default function App() {
               "no version yet"
             )}
           </div>
+          {hudCollapsed ? (
+            <div className="hud-line">{fps < 0.5 ? "idle" : `${fps.toFixed(0)} fps`} · {MODE_LABELS[mode]}</div>
+          ) : (<>
           <div className="surface-switch">
             <button className={mode === "dense" ? "on" : ""} onClick={() => show("dense")} title="1 or V">
               Point cloud
@@ -445,11 +474,12 @@ export default function App() {
               </span>
             </div>
           )}
-          <div className="muted">WASD / drag · V cloud ⇄ splats · 1 cloud · 2 splats · 3 by video · 4 sparse · K splat kind · C cameras · M map · L place names · B blocks · [ ] splat size · ▶ on a video replays its path (P pause · Esc stop)</div>
+          <div className="muted">WASD / drag · V cloud ⇄ splats · 1 cloud · 2 splats · 3 by video · 4 sparse · K splat kind · C cameras · M map · L place names · N street names · B blocks · [ ] splat size · ▶ on a video replays its path (P pause · Esc stop)</div>
           <label className="follow">
             <input type="checkbox" checked={followLive} onChange={(e) => setFollowLive(e.target.checked)} /> follow
             live training
           </label>
+          </>)}
         </div>
         <div className="toasts">
           {toasts.map((t) => (
@@ -459,16 +489,21 @@ export default function App() {
           ))}
         </div>
       </main>
-      {state && (
-        <ScenePanel
-          state={state}
-          viewingVersionId={viewingVersionId}
-          onViewVersion={setViewingVersionId}
-          canReplay={(c) => pathOf(c) != null}
-          onReplay={play}
-          onError={(m) => toast(m, "error")}
-        />
-      )}
+      <div className={`side right${panelCollapsed ? " collapsed" : ""}`}>
+        <button className="collapse" onClick={() => setPanelCollapsed((v) => !v)} title={panelCollapsed ? "Show videos and versions" : "Hide videos and versions"}>
+          {panelCollapsed ? "‹" : "›"}
+        </button>
+        {state && (
+          <ScenePanel
+            state={state}
+            viewingVersionId={viewingVersionId}
+            onViewVersion={setViewingVersionId}
+            canReplay={(c) => pathOf(c) != null}
+            onReplay={play}
+            onError={(m) => toast(m, "error")}
+          />
+        )}
+      </div>
     </div>
   );
 }

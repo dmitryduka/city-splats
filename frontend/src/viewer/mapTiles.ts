@@ -82,16 +82,20 @@ export type MapLayer = {
   dispose: () => void;
 };
 
-/** One zoom level at a time (overlapping levels flicker against each other): tiles about the
- * camera's height above the map (TILE_MIN_M..TILE_MAX_M), RADIUS tiles each way around the
- * point under it. The level changes once the height is ZOOM_HYSTERESIS levels past the
- * current one, so hovering near a boundary doesn't reload. Beyond MAX_LOADED tiles the ones
- * farthest from the camera go. */
-const RADIUS = 4;
+/** A quadtree of tiles out to RANGE_M around the camera: a tile is split into its four
+ * children while the camera is closer than SPLIT of its sizes (counting the camera's height),
+ * down to tiles about the camera's height above the map (TILE_MIN_M..TILE_MAX_M), so detail
+ * falls off with distance and the tiles never overlap (overlapping levels flicker against
+ * each other). The finest level changes once the height is ZOOM_HYSTERESIS levels past it,
+ * so hovering near a boundary doesn't reload. Tiles that were replaced stay, pushed behind,
+ * until their replacements have loaded (or RETIRE_MS), so the map doesn't blink on a change.
+ * With a single level of RADIUS 4 tiles the map ended ~1 km away at a low flight. */
+const RANGE_M = 8000;
+const SPLIT = 2;
 const TILE_MIN_M = 75;
 const TILE_MAX_M = 5000;
 const ZOOM_HYSTERESIS = 0.7;
-const MAX_LOADED = 200;
+const RETIRE_MS = 3000;
 /** Terrain mesh: a vertex every grid step, at most this many quads along a tile's side. */
 const MAX_SEGMENTS = 48;
 
@@ -116,7 +120,11 @@ export function buildMap(
   const metresPerTile = (z: number) => (EARTH_CIRCUMFERENCE * Math.cos((lat * Math.PI) / 180)) / 2 ** z;
 
   const loader = new THREE.TextureLoader().setCrossOrigin("anonymous");
-  type Tile = { mesh: THREE.Mesh; material: THREE.MeshBasicMaterial; geometry: THREE.PlaneGeometry; centre: THREE.Vector2 };
+  type Tile = {
+    mesh: THREE.Mesh; material: THREE.MeshBasicMaterial; geometry: THREE.PlaneGeometry; centre: THREE.Vector2;
+    /** Its texture loaded, or no provider served it. */
+    settled: boolean;
+  };
   const tiles = new Map<string, Tile>();
   let disposed = false;
   let failures = 0;
@@ -153,11 +161,13 @@ export function buildMap(
     mesh.renderOrder = -2;
     mesh.visible = false;
     group.add(mesh);
-    const tile = { mesh, material, geometry, centre: new THREE.Vector2(mesh.position.x, mesh.position.y) };
+    const tile: Tile = { mesh, material, geometry, centre: new THREE.Vector2(mesh.position.x, mesh.position.y), settled: false };
     tiles.set(key, tile);
     drape(tile);
     const attempt = (k: number) => {
       if (k >= providers.length) {
+        tile.settled = true;
+        onChange();
         if (++failures === 1) onSource(providers[0].attribution, true);
         return;
       }
@@ -169,6 +179,7 @@ export function buildMap(
         material.map = texture;
         material.needsUpdate = true;
         mesh.visible = true;
+        tile.settled = true;
         onSource(provider.attribution, false);
         onChange();
       }, undefined, () => !disposed && tiles.has(key) && attempt(k + 1));
@@ -180,45 +191,92 @@ export function buildMap(
     const tile = tiles.get(key);
     if (!tile) return;
     tiles.delete(key);
+    retiring.delete(key);
     tile.mesh.removeFromParent();
     tile.material.map?.dispose();
     tile.material.dispose();
     tile.geometry.dispose();
   };
 
+  // Tiles replaced but kept until the new ones show, drawn behind them.
+  const retiring = new Set<string>();
+  let retiringSince = 0;
+  const retire = (key: string, on: boolean) => {
+    const tile = tiles.get(key)!;
+    tile.material.polygonOffset = on;
+    tile.material.polygonOffsetFactor = tile.material.polygonOffsetUnits = on ? 4 : 0;
+    tile.material.needsUpdate = true;
+    tile.mesh.renderOrder = on ? -3 : -2;
+    if (on) retiring.add(key);
+    else retiring.delete(key);
+  };
+
   const local = new THREE.Vector3();
+  const planned = new THREE.Vector3(Infinity, Infinity, Infinity);
   const inverse = new THREE.Matrix4();
   let zoom = 0;
-  let last = "";
+  let wanted = new Set<string>();
+
+  /** The quadtree's leaves around the camera (map frame) at `height` above the ground. */
+  const plan = (height: number) => {
+    const next = new Set<string>();
+    const visit = (z: number, x: number, y: number) => {
+      const m = metresPerTile(z);
+      const [ox, oy] = tileXY(lat, lon, z);
+      const x0 = (x - ox) * m, y1 = -(y - oy) * m;
+      const flat = Math.hypot(Math.max(x0 - local.x, 0, local.x - x0 - m), Math.max(y1 - m - local.y, 0, local.y - y1));
+      if (flat > RANGE_M) return;
+      if (z < zoom && Math.hypot(flat, height) < SPLIT * m) {
+        for (const [i, j] of [[0, 0], [1, 0], [0, 1], [1, 1]]) visit(z + 1, 2 * x + i, 2 * y + j);
+      } else next.add(`${z}/${x}/${y}`);
+    };
+    // Roots: the level whose tiles are about RANGE_M across.
+    const z0 = Math.min(Math.max(Math.floor(Math.log2(metresPerTile(0) / RANGE_M)), 0), zoom);
+    const m = metresPerTile(z0);
+    const [ox, oy] = tileXY(lat, lon, z0);
+    for (let x = Math.floor(ox + (local.x - RANGE_M) / m); x <= Math.floor(ox + (local.x + RANGE_M) / m); x++)
+      for (let y = Math.floor(oy - (local.y + RANGE_M) / m); y <= Math.floor(oy - (local.y - RANGE_M) / m); y++) visit(z0, x, y);
+    return next;
+  };
+
   const follow = (cameraWorld: THREE.Vector3) => {
     if (disposed) return;
     group.updateWorldMatrix(true, false);
     local.copy(cameraWorld).applyMatrix4(inverse.copy(group.matrixWorld).invert());
     const ground = heights ? heights(local.x, local.y) : 0;
     const height = Math.min(Math.max(Math.abs(local.z - ground), TILE_MIN_M), TILE_MAX_M);
-    const wanted = Math.min(Math.max(Math.log2(metresPerTile(0) / height), 3), maxZoom);
-    if (!zoom || Math.abs(wanted - zoom) > ZOOM_HYSTERESIS) {
-      const next = Math.round(wanted);
-      if (next !== zoom) {
-        for (const key of [...tiles.keys()]) removeTile(key);
-        zoom = next;
-        onChange();
-      }
+    const finest = Math.min(Math.max(Math.log2(metresPerTile(0) / height), 3), maxZoom);
+    let changed = false;
+    if (!zoom || Math.abs(finest - zoom) > ZOOM_HYSTERESIS) {
+      const next = Math.round(finest);
+      changed = next !== zoom;
+      zoom = next;
     }
-    const m = metresPerTile(zoom);
-    const [ox, oy] = tileXY(lat, lon, zoom);
-    const mx = Math.floor(ox + local.x / m);
-    const my = Math.floor(oy - local.y / m);
-    // Only when the camera reaches another tile or level.
-    const key = `${zoom}/${mx}/${my}`;
-    if (key === last) return;
-    last = key;
-    for (let tx = mx - RADIUS; tx <= mx + RADIUS; tx++)
-      for (let ty = my - RADIUS; ty <= my + RADIUS; ty++) addTile(zoom, tx, ty);
-    if (tiles.size > MAX_LOADED) {
-      const here = new THREE.Vector2(local.x, local.y);
-      const far = [...tiles].sort(([, a], [, b]) => b.centre.distanceTo(here) - a.centre.distanceTo(here));
-      for (const [k] of far.slice(0, tiles.size - MAX_LOADED)) removeTile(k);
+    // Planned again once the camera has moved a quarter of a finest tile, or the level changed.
+    if (changed || local.distanceTo(planned) > metresPerTile(zoom) / 4) {
+      planned.copy(local);
+      wanted = plan(height);
+      for (const key of tiles.keys()) {
+        if (wanted.has(key)) {
+          if (retiring.has(key)) retire(key, false);
+        } else if (!retiring.has(key)) {
+          if (!tiles.get(key)!.settled) removeTile(key);
+          else {
+            retire(key, true);
+            retiringSince = performance.now();
+          }
+        }
+      }
+      for (const key of wanted) {
+        const [z, x, y] = key.split("/").map(Number);
+        addTile(z, x, y);
+      }
+      onChange();
+    }
+    if (retiring.size && ([...wanted].every((k) => tiles.get(k)?.settled) || performance.now() - retiringSince > RETIRE_MS)) {
+      for (const key of retiring) removeTile(key);
+      retiring.clear();
+      onChange();
     }
   };
 

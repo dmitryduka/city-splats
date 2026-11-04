@@ -1,7 +1,13 @@
+import streets from "./streets.json";
+
 /** Named places to label over a GPS-placed scene. Coordinates from OpenStreetMap (Overpass,
  * Nov 2026: the feature's node, or its outline's centre); `h` is the height of the dot above
  * the terrain, metres (the top of a tower or statue, a roof; 0 or left out: the ground). */
-export type Place = { name: string; note?: string; lat: number; lon: number; h?: number; major?: boolean };
+export type Place = {
+  name: string; note?: string; lat: number; lon: number; h?: number; major?: boolean;
+  /** A street's name: its rank, 0 trunk/primary, 1 secondary, 2 tertiary/pedestrian, 3 other. */
+  street?: number;
+};
 
 export const PLACES: Place[] = [
   // Landmarks, labelled from far away.
@@ -62,3 +68,8 @@ export const PLACES: Place[] = [
   { name: "Saint Hakob Church", note: "Kanaker", lat: 40.22033, lon: 44.53497, h: 12 },
   { name: "Cathedral of Avan", note: "6th century", lat: 40.21506, lon: 44.57195, h: 8 },
 ];
+
+/** Street names from OpenStreetMap (named roads in Yerevan, Overpass, Nov 2026): the English
+ * name (name:en, else int_name) at points along each street, every 700 m on the main roads
+ * and 900-1200 m on the others; one at its middle when it is shorter. [name, rank, lat, lon]. */
+export const STREETS: Place[] = (streets as [string, number, number, number][]).map(([name, street, lat, lon]) => ({ name, street, lat, lon }));

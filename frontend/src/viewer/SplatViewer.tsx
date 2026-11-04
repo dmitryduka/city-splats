@@ -5,7 +5,7 @@ import { dyno, SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark
 import { buildMap, type Geo, type MapLayer, type MapStyle } from "./mapTiles";
 import { buildBlocks, type BlockOverlay } from "./blockOverlay";
 import { buildPlaceLabels, type PlaceLabels } from "./placeLabels";
-import { PLACES } from "./places";
+import { PLACES, STREETS } from "./places";
 import type { CameraReplay } from "./cameraPath";
 
 /** "dense" and "splats" both show the streamed meshes at splatUrl (a dense cloud is streamed
@@ -36,8 +36,9 @@ type Props = {
   mapStyle?: MapStyle | null;
   /** Map raised by this many metres (negative: lowered); the place labels with it. */
   mapLift?: number;
-  /** Names over known places (needs geo). */
+  /** Names over known places, and street names (need geo). */
   showPlaces?: boolean;
+  showStreets?: boolean;
   /** The map's attribution once tiles load; failed when no provider served a tile. */
   onMapSource?: (attribution: string, failed: boolean) => void;
   /** Splat training blocks drawn on the map plane (needs geo; null: hidden). */
@@ -117,6 +118,7 @@ export function SplatViewer({
   mapStyle = null,
   mapLift = 0,
   showPlaces = false,
+  showStreets = false,
   onMapSource,
   blocks = null,
   replay = null,
@@ -357,15 +359,16 @@ export function SplatViewer({
   // Place labels over the scene.
   useEffect(() => {
     const ctx = ctxRef.current;
-    if (!ctx || !geo || !showPlaces) return;
-    const places = buildPlaceLabels(geo, PLACES, ctx.world, containerRef.current!, () => (ctx.dirty = true));
+    if (!ctx || !geo || !(showPlaces || showStreets)) return;
+    const shown = [...(showPlaces ? PLACES : []), ...(showStreets ? STREETS : [])];
+    const places = buildPlaceLabels(geo, shown, ctx.world, containerRef.current!, () => (ctx.dirty = true));
     places.setLift(mapLiftRef.current);
     ctx.places = places;
     return () => {
       if (ctx.places === places) ctx.places = undefined;
       places.dispose();
     };
-  }, [geo, showPlaces, pixelRatio, lodSplatScale]);
+  }, [geo, showPlaces, showStreets, pixelRatio, lodSplatScale]);
 
   // Training blocks on the map plane.
   useEffect(() => {

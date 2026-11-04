@@ -10,7 +10,12 @@ const RANGE_M = 30_000;
 const NEAR_M = 800;
 const FAR_M = 3_000;
 const MAJOR_FAR_M = 15_000;
+/** Streets: main roads (rank 0-1) out to MAIN_STREET_FAR_M, the others to STREET_FAR_M. */
+const MAIN_STREET_FAR_M = 2_000;
+const STREET_FAR_M = 900;
+/** At most this many labels at once: places, and streets on top. */
 const MAX_SHOWN = 30;
+const MAX_STREETS = 25;
 /** A label appears once it has had room for this long, so flying doesn't make them flicker. */
 const SETTLE_MS = 250;
 /** Pixels: the stem's height above the dot, and the free border around the screen. */
@@ -70,7 +75,7 @@ export function buildPlaceLabels(
     const north = (place.lat - lat0) * rad * EARTH_RADIUS;
     if (Math.hypot(east, north) > RANGE_M) continue;
     const el = document.createElement("div");
-    el.className = `place off${place.major ? " major" : ""}`;
+    el.className = `place off${place.major ? " major" : ""}${place.street !== undefined ? " street" : ""}`;
     el.innerHTML = `<i class="dot"></i><i class="stem"></i><div class="txt"><b></b><span></span></div>`;
     const txt = el.querySelector<HTMLDivElement>(".txt")!;
     txt.querySelector("b")!.textContent = place.name;
@@ -118,18 +123,22 @@ export function buildPlaceLabels(
       const r = e.getBoundingClientRect();
       return { x0: r.left - box.left, x1: r.right - box.left, y0: r.top - box.top, y1: r.bottom - box.top };
     });
-    let shown = 0;
+    let shown = 0, streets = 0;
     let waiting = false;
     const order = labels
       .map((l) => ({ l, d: eye.distanceTo(l.p) }))
-      .sort((a, b) => +!a.l.place.major - +!b.l.place.major || +!a.l.on - +!b.l.on || a.d - b.d);
+      .sort((a, b) => +!a.l.place.major - +!b.l.place.major || (a.l.place.street ?? -1) - (b.l.place.street ?? -1)
+        || +!a.l.on - +!b.l.on || a.d - b.d);
     for (const { l, d } of order) {
       let rect: Rect | null = null;
       let side = l.side;
       v.copy(l.p).applyMatrix4(worldFromMap).project(camera);
       const x = (v.x * 0.5 + 0.5) * width, y = (-v.y * 0.5 + 0.5) * height;
       const inView = v.z > -1 && v.z < 1 && x > -20 && x < width + 20 && y > 0 && y < height + 20;
-      if (shown < MAX_SHOWN && inView && d < (l.place.major ? MAJOR_FAR_M : FAR_M)) {
+      const street = l.place.street;
+      const far = street === undefined ? (l.place.major ? MAJOR_FAR_M : FAR_M) : street <= 1 ? MAIN_STREET_FAR_M : STREET_FAR_M;
+      const room = street === undefined ? shown < MAX_SHOWN : streets < MAX_STREETS;
+      if (room && inView && d < far) {
         const near = d < NEAR_M;
         if (near !== l.near) l.el.classList.toggle("near", near);
         l.near = near;
@@ -154,7 +163,8 @@ export function buildPlaceLabels(
       const on = l.on || now - l.since >= SETTLE_MS;
       waiting ||= !on;
       if (!on) continue;
-      shown++;
+      if (street === undefined) shown++;
+      else streets++;
       if (side !== l.side) l.el.classList.toggle("left", side === "l");
       l.side = side;
       l.el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
